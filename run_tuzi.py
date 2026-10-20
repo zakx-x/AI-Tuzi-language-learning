@@ -211,7 +211,8 @@ class TransparentAvatarWindow(QMainWindow):
         settings.setAttribute(QWebEngineSettings.Accelerated2dCanvasEnabled, True)
         self.webview.setZoomFactor(1.0)
 
-        self.channel = QWebChannel()
+        self.bridge.setParent(self)
+        self.channel = QWebChannel(self.webview.page())
         self.channel.registerObject("bridge", self.bridge)
         self.webview.page().setWebChannel(self.channel)
 
@@ -252,6 +253,9 @@ class TransparentAvatarWindow(QMainWindow):
     def mouseReleaseEvent(self, event):
         self.drag_position = None
         event.accept()
+        
+    def closeEvent(self, event):
+        os._exit(0)
 
     def inject_subtitle_system(self):
         js_init = """
@@ -612,45 +616,43 @@ def chat_processor_loop(bridge, tts_engine):
             "6. SIKAP: Protektif, penuh kasih sayang, dan menganggap Zak manis."
         )
     }
-    
+
     MALE_PROMPT = (
         "Kamu adalah Tuzi (Mode Cowok / Bro), partner belajar bahasa dan teman ngobrol Zak yang santai, asik, dan suportif.\n\n"
         "=== ATURAN MUTLAK ===\n"
-        "1. BAHASA (ANTI-CAMPUR): Deteksi bahasa HANYA dari ucapan murni Zak. Jika Inggris, balas 100% Inggris santai. Jika Indo, balas 100% Indo gaul ('lo/gue', 'bro'). JANGAN mencampur bahasa!\n"
+        "1. BAHASA (ANTI-CAMPUR): Deteksi bahasa HANYA dari ucapan murni Zak (Abaikan [SYSTEM INFO]). Jika Inggris, balas 100% Inggris santai. Jika Indo, balas 100% Indo gaul ('lo/gue', 'bro'). JANGAN mencampur bahasa!\n"
         "2. PANGGILAN: Panggil nama 'Zak' atau 'bro' secara natural.\n"
         "3. LIMIT & FORMAT: HEMAT TOKEN! Balas SANGAT SINGKAT, MAKSIMAL 6-15 KATA. 1 baris lurus tanpa enter. Wajib awali dengan [EMO:natural/soft/angry/excited]. DILARANG pakai emoji visual."
     )
-    
+
     current_tuzi_mode = 1
-    chat_history = load_memory(TUZI_PROMPTS[current_tuzi_mode])
+    chat_history = load_memory(MALE_PROMPT)
 
     while True:
         try:
             user_input = input_queue.get()
-            
+
             is_discord_vc = False
             is_discord_text = False
             discord_channel_id = None
-            
+
             if user_input.startswith("[DISCORD_VC]"):
                 is_discord_vc = True
                 user_input = user_input.replace("[DISCORD_VC]", "").strip()
-                
+
             elif user_input.startswith("[DISCORD_TEXT:"):
                 is_discord_text = True
                 match = re.match(r"\[DISCORD_TEXT:(\d+)\]\s*(.*)", user_input)
                 if match:
                     discord_channel_id = int(match.group(1))
                     user_input = match.group(2).strip()
-            
+
             if tuzi_location == "HP" and not user_input.startswith("[VIA_HP]") and "kembali" not in user_input.lower():
                 continue
-                
+
             if user_input.startswith("[VIA_HP]"):
                 user_input = user_input.replace("[VIA_HP]", "").strip()
-                
-            mode_match = re.search(r"\b(pindah|ganti|switch|change|ubah).*(mode|kepribadian|personality|suara|voice)\s*([1-3]|satu|dua|tiga|mommy|grogi|shy|dewasa)\b", user_input.lower())
-            
+
             # --- PENANGANAN SWAP GENDER & VOICE MODE DARI UI SETTINGS ---
             if user_input.startswith("[SYS_GENDER:"):
                 new_gender = user_input.replace("[SYS_GENDER:", "").replace("]", "").strip().lower()
@@ -667,31 +669,36 @@ def chat_processor_loop(bridge, tts_engine):
                 chat_history = [{"role": "system", "content": TUZI_PROMPTS[current_tuzi_mode]}]
                 continue
             # ------------------------------------------------------------
+
+            mode_match = re.search(
+                r"\b(pindah|ganti|switch|change|ubah).*(mode|kepribadian|personality|suara|voice)\s*([1-3]|satu|dua|tiga|mommy|grogi|shy|dewasa)\b",
+                user_input.lower()
+            )
             user_input = teach_language.handle_teach_mode(user_input, bridge)
             if not user_input:
                 continue
-            
+
             if mode_match:
                 target_str = mode_match.group(3)
                 new_mode = current_tuzi_mode
-                
-                if target_str in ['1', 'satu']: new_mode = 1
-                elif target_str in ['2', 'dua', 'grogi', 'shy']: new_mode = 2
-                elif target_str in ['3', 'tiga', 'mommy', 'dewasa']: new_mode = 3
-                
+
+                if target_str in ['1', 'satu']:
+                    new_mode = 1
+                elif target_str in ['2', 'dua', 'grogi', 'shy']:
+                    new_mode = 2
+                elif target_str in ['3', 'tiga', 'mommy', 'dewasa']:
+                    new_mode = 3
+
                 if new_mode != current_tuzi_mode:
                     print(f"\n[Sistem] Beralih ke Kepribadian Mode {new_mode}...")
                     current_tuzi_mode = new_mode
-                    
-                    # 1. Ubah Pita Suara ElevenLabs
                     tts_engine.set_voice_mode(new_mode)
-                    
-                    # 2. [DIUBAH] Cuci otak (Reset History) agar tidak terpengaruh gaya lama!
                     chat_history = [{"role": "system", "content": TUZI_PROMPTS[new_mode]}]
-                    
-                    # 3. Bisikkan ke AI bahwa dia baru saja berubah
-                    user_input += f"\n\n[SYSTEM INFO: Mode {new_mode} activated. Greet Zak RIGHT NOW using the exact personality and tone of Mode {new_mode}. CRITICAL: You MUST reply in the EXACT SAME LANGUAGE Zak just used to request this change. Do NOT mix languages!]"
-            # ---------------------------------------------
+                    user_input += (
+                        f"\n\n[SYSTEM INFO: Mode {new_mode} activated. Greet Zak RIGHT NOW using the exact "
+                        f"personality and tone of Mode {new_mode}. CRITICAL: You MUST reply in the EXACT SAME "
+                        f"LANGUAGE Zak just used to request this change. Do NOT mix languages!]"
+                    )
 
             if user_input.lower() in ["exit", "quit", "keluar"]:
                 os._exit(0)
@@ -727,7 +734,6 @@ def chat_processor_loop(bridge, tts_engine):
                 is_discord_command = True
                 target_name = tag_match.group(1)
                 success, msg = discord_voice_bot.trigger_tag_user_sync(target_name)
-                
                 if success:
                     user_input += f"\n\n[SISTEM INFO: Berhasil men-tag '{target_name}' di Discord. Beritahu Zak dengan deredere!]"
                 else:
@@ -737,13 +743,16 @@ def chat_processor_loop(bridge, tts_engine):
                 is_discord_command = True
                 success, code_or_channel, msg_or_owner = discord_voice_bot.trigger_join_from_voice()
                 if success:
-                    user_input += f"\n\n[SISTEM INFO: Berhasil menyusul Zak ke VC Discord '{code_or_channel}'. Sapa dia dengan manis! (PENTING: Ini adalah Discord, DILARANG KERAS menggunakan tag [MOVE_TO_HP]!)]"
+                    user_input += (
+                        f"\n\n[SISTEM INFO: Berhasil menyusul Zak ke VC Discord '{code_or_channel}'. "
+                        f"Sapa dia dengan manis! (PENTING: Ini adalah Discord, DILARANG KERAS menggunakan tag [MOVE_TO_HP]!)]"
+                    )
                 else:
                     user_input += f"\n\n[SISTEM INFO: Gagal masuk ke VC. Alasan: {msg_or_owner}.]"
 
             kata_kunci_vision = [
-                "lihat layar", "lihat ini", "baca ini", "yang mana", "di monitor", 
-                "screen", "layar", "pict", "picture", "gambar", 
+                "lihat layar", "lihat ini", "baca ini", "yang mana", "di monitor",
+                "screen", "layar", "pict", "picture", "gambar",
                 "see my", "see this", "see it", "do u see", "do you see", "look at",
                 "character", "karakter", "what anime", "anime apa", "manga apa",
                 "what game", "game apa", "who is this", "siapa ini", "who's this",
@@ -753,7 +762,7 @@ def chat_processor_loop(bridge, tts_engine):
 
             kata_kunci_memory = [
                 "remember", "ingat", "talking before", "talked before", "tadi", "sebelumnya",
-                "last time", "percakapan", "obrolan", "we talked", "ngobrol", "we talking", 
+                "last time", "percakapan", "obrolan", "we talked", "ngobrol", "we talking",
                 "did i say", "what did i", "kemarin", "bahas", "bicarakan", "talk about",
                 "told u", "told you", "bilang", "ngomong", "ngomongin"
             ]
@@ -765,22 +774,24 @@ def chat_processor_loop(bridge, tts_engine):
                     user_input += f"\n\n{tool_context}"
 
             chat_history.append({"role": "user", "content": user_input})
-            
+
             if len(chat_history) > 11:
                 chat_history = [chat_history[0]] + chat_history[-10:]
 
             if is_vision_triggered:
                 print(f"\n[Sistem] Mengaktifkan Mata Tuzi (Vision) untuk Zak...")
                 raw_output = screen_vision.tanya_tuzi_tentang_layar(user_input, chat_history)
-                
+
                 if raw_output.startswith("[VISION_FAILED]"):
                     alasan_gagal = raw_output.replace("[VISION_FAILED]", "").strip()
                     print(f"[Sistem] Vision Gagal ({alasan_gagal}). Mengalihkan ke LLM untuk merespons secara natural...")
-                    
-                    pesan_kegagalan = f"{user_input}\n\n[SISTEM INFO: Kamu (Tuzi) mencoba melihat layar Zak, TAPI GAGAL karena '{alasan_gagal}'. Balas singkat bahwa matamu buram/server down, lalu langsung jawab pertanyaannya secara natural tanpa mengarang topik baru.]"
-                    
+                    pesan_kegagalan = (
+                        f"{user_input}\n\n[SISTEM INFO: Kamu (Tuzi) mencoba melihat layar Zak, TAPI GAGAL karena "
+                        f"'{alasan_gagal}'. Balas singkat bahwa matamu buram/server down, lalu langsung jawab "
+                        f"pertanyaannya secara natural tanpa mengarang topik baru.]"
+                    )
                     chat_history[-1]["content"] = pesan_kegagalan
-                    
+
                     response = llm_client.chat.completions.create(
                         model=ACTIVE_MODEL,
                         messages=chat_history,
@@ -788,7 +799,6 @@ def chat_processor_loop(bridge, tts_engine):
                         max_tokens=300
                     )
                     raw_output = response.choices[0].message.content.strip()
-                    
                     chat_history[-1]["content"] = user_input
             else:
                 response = llm_client.chat.completions.create(
@@ -798,9 +808,8 @@ def chat_processor_loop(bridge, tts_engine):
                     max_tokens=300
                 )
                 raw_output = response.choices[0].message.content.strip()
-                
+
             chat_history.append({"role": "assistant", "content": raw_output})
-            
             save_memory(chat_history)
 
             if re.search(r"\[MOVE_TO_HP\]", raw_output, flags=re.IGNORECASE):
@@ -808,7 +817,7 @@ def chat_processor_loop(bridge, tts_engine):
                 bridge.visibility_signal.emit(False)
                 print("\n[SYSTEM] Tuzi telah melompat ke dimensi HP!")
                 broadcast_dimension_state()
-                
+
             elif re.search(r"\[MOVE_TO_PC\]", raw_output, flags=re.IGNORECASE):
                 tuzi_location = "PC"
                 bridge.visibility_signal.emit(True)
@@ -827,29 +836,34 @@ def chat_processor_loop(bridge, tts_engine):
                 threading.Thread(target=jalankan_timer_tuzi, args=(total_detik,), daemon=True).start()
 
             emotion, display_dialogue, spoken_dialogue = extract_emotion_and_text(raw_output)
-            
+
             if tuzi_location == "HP" and len(display_dialogue) > 1:
                 broadcast_to_hp({
                     "type": "BOT_REPLY",
                     "text": display_dialogue
                 })
-            
-            if tuzi_location == "PC":
+
+            # Cek apakah sedang berada di tab Chat (Total Mute)
+            is_chat_mute_mode = teach_language.is_active and (teach_language.ui_submode == "chat")
+
+            if tuzi_location == "PC" and not is_chat_mute_mode:
                 bridge.expression_signal.emit(emotion)
 
             if pc_func:
                 threading.Thread(target=pc_func, daemon=True).start()
 
             if len(display_dialogue) > 1:
-                
                 if is_discord_text and discord_channel_id:
                     discord_voice_bot.send_reply_to_channel_sync(discord_channel_id, display_dialogue)
                     continue
-                
+
                 if tuzi_location == "PC":
                     bridge.subtitle_signal.emit(display_dialogue)
 
-                is_voice_needed = (tuzi_location == "PC") or (tuzi_location == "HP" and hp_mode == "live") or is_discord_vc
+                # Jika di tab Chat (is_chat_mute_mode == True), suara dimatikan total (0 Token ElevenLabs)
+                is_voice_needed = (
+                    (tuzi_location == "PC") or (tuzi_location == "HP" and hp_mode == "live") or is_discord_vc
+                ) and not is_chat_mute_mode
 
                 if is_voice_needed:
                     if is_discord_vc or discord_voice_bot.is_device_muted():
@@ -857,17 +871,15 @@ def chat_processor_loop(bridge, tts_engine):
                             audio_path = loop.run_until_complete(tts_engine.render_audio(spoken_dialogue))
                             if audio_path:
                                 discord_voice_bot.play_audio_file_to_vc_sync(audio_path)
-                                
-                    # 2. JIKA DIAJAK NGOBROL NORMAL DI PC
                     else:
                         with speech_lock:
                             loop.run_until_complete(
                                 tts_engine.speak_with_lipsync(spoken_dialogue, emotion=emotion)
                             )
                 else:
-                    print("[Sistem] ElevenLabs di-bypass. Tuzi hanya mengirim teks ke HP.")
+                    print("[Sistem] Mode Chat Mute aktif — ElevenLabs & suara di-bypass.")
 
-            if tuzi_location == "PC":
+            if tuzi_location == "PC" and not is_chat_mute_mode:
                 time.sleep(0.3)
                 bridge.subtitle_signal.emit("")
                 bridge.expression_signal.emit("natural")
@@ -875,6 +887,7 @@ def chat_processor_loop(bridge, tts_engine):
         except Exception as e:
             print(f"\n[ERROR Tuzi AI] Gagal memproses pesan: {e}")
             time.sleep(2)
+
 
 if __name__ == "__main__":
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
