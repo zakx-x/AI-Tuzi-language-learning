@@ -165,6 +165,9 @@ class AvatarSignalBridge(QObject):
     timer_signal = pyqtSignal(int) 
     visibility_signal = pyqtSignal(bool)
     teach_mode_signal = pyqtSignal(bool)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
 
     @pyqtSlot(str)
     def start_ptt(self, lang_code: str):
@@ -176,7 +179,8 @@ class AvatarSignalBridge(QObject):
 
     @pyqtSlot()
     def exit_teach_ui(self):
-        input_queue.put("exit teach mode")
+            print("\n[Sistem] Tombol Hang-up ditekan. Menutup aplikasi...")
+            os._exit(0)
 
 class TransparentAvatarWindow(QMainWindow):
     def __init__(self, bridge):
@@ -354,23 +358,31 @@ class TransparentAvatarWindow(QMainWindow):
 class ElevenLabsTTSEngine:
     def __init__(self, bridge):
         self.bridge = bridge
-        self.api_key = getattr(config, "ELEVENLABS_API_KEY", "")
+        self.voice_cfg = getattr(config, "VoiceConfig", None)
+        self.api_key = getattr(self.voice_cfg, "API_KEY", getattr(config, "ELEVENLABS_API_KEY", ""))
+        self.model_id = getattr(self.voice_cfg, "MODEL_ID", "eleven_v4_turbo")
         self.client = ElevenLabs(api_key=self.api_key)
-        self.voice_1 = getattr(config, "ELEVENLABS_VOICE_1", "")
-        self.voice_2 = getattr(config, "ELEVENLABS_VOICE_2", "")
-        self.voice_3 = getattr(config, "ELEVENLABS_VOICE_3", "")
-        
-        self.voice_id = self.voice_1
-        self.set_voice_mode(1)
+
+        self.current_gender = "male"
+        self.current_mode = 1
+        self.voice_id = ""
+        self.set_voice("male", 1)
         pygame.mixer.init()
-        
+
+    def set_voice(self, gender: str = "female", mode: int = 1):
+        self.current_gender = gender.lower()
+        self.current_mode = mode
+        if self.voice_cfg:
+            self.voice_id = self.voice_cfg.get_voice_id(self.current_gender, self.current_mode)
+        else:
+            # Fallback jika VoiceConfig belum dibuat di config.py
+            if self.current_gender == "male":
+                self.voice_id = getattr(config, "ELEVENLABS_VOICE_MALE", "")
+            else:
+                self.voice_id = getattr(config, f"ELEVENLABS_VOICE_{mode}", "")
+
     def set_voice_mode(self, mode: int):
-        if mode == 1 and self.voice_1: 
-            self.voice_id = self.voice_1
-        elif mode == 2 and self.voice_2: 
-            self.voice_id = self.voice_2
-        elif mode == 3 and self.voice_3: 
-            self.voice_id = self.voice_3
+        self.set_voice(self.current_gender, mode)
 
     async def render_audio(self, text: str):
         if not self.api_key or self.api_key == "paste_api_key_elevenlabs_kamu_di_sini":
@@ -601,6 +613,14 @@ def chat_processor_loop(bridge, tts_engine):
         )
     }
     
+    MALE_PROMPT = (
+        "Kamu adalah Tuzi (Mode Cowok / Bro), partner belajar bahasa dan teman ngobrol Zak yang santai, asik, dan suportif.\n\n"
+        "=== ATURAN MUTLAK ===\n"
+        "1. BAHASA (ANTI-CAMPUR): Deteksi bahasa HANYA dari ucapan murni Zak. Jika Inggris, balas 100% Inggris santai. Jika Indo, balas 100% Indo gaul ('lo/gue', 'bro'). JANGAN mencampur bahasa!\n"
+        "2. PANGGILAN: Panggil nama 'Zak' atau 'bro' secara natural.\n"
+        "3. LIMIT & FORMAT: HEMAT TOKEN! Balas SANGAT SINGKAT, MAKSIMAL 6-15 KATA. 1 baris lurus tanpa enter. Wajib awali dengan [EMO:natural/soft/angry/excited]. DILARANG pakai emoji visual."
+    )
+    
     current_tuzi_mode = 1
     chat_history = load_memory(TUZI_PROMPTS[current_tuzi_mode])
 
@@ -630,6 +650,23 @@ def chat_processor_loop(bridge, tts_engine):
                 user_input = user_input.replace("[VIA_HP]", "").strip()
                 
             mode_match = re.search(r"\b(pindah|ganti|switch|change|ubah).*(mode|kepribadian|personality|suara|voice)\s*([1-3]|satu|dua|tiga|mommy|grogi|shy|dewasa)\b", user_input.lower())
+            
+            # --- PENANGANAN SWAP GENDER & VOICE MODE DARI UI SETTINGS ---
+            if user_input.startswith("[SYS_GENDER:"):
+                new_gender = user_input.replace("[SYS_GENDER:", "").replace("]", "").strip().lower()
+                tts_engine.set_voice(new_gender, current_tuzi_mode)
+                if new_gender == "male":
+                    chat_history = [{"role": "system", "content": MALE_PROMPT}]
+                else:
+                    chat_history = [{"role": "system", "content": TUZI_PROMPTS[current_tuzi_mode]}]
+                continue
+
+            if user_input.startswith("[SYS_FMODE:"):
+                current_tuzi_mode = int(user_input.replace("[SYS_FMODE:", "").replace("]", "").strip())
+                tts_engine.set_voice("female", current_tuzi_mode)
+                chat_history = [{"role": "system", "content": TUZI_PROMPTS[current_tuzi_mode]}]
+                continue
+            # ------------------------------------------------------------
             user_input = teach_language.handle_teach_mode(user_input, bridge)
             if not user_input:
                 continue
