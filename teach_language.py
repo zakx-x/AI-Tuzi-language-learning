@@ -22,6 +22,7 @@ TEACH_WIN_HEIGHT = 900
 DEFAULT_WIN_WIDTH = 600
 DEFAULT_WIN_HEIGHT = 1300
 
+
 def stop_all_voice_playback():
     """Menghentikan suara Tuzi secara instan saat pindah ke mode Chat (Total Mute)."""
     try:
@@ -30,14 +31,16 @@ def stop_all_voice_playback():
     except Exception:
         pass
 
+
 def get_qwebchannel_js() -> str:
-    """Membaca qwebchannel.js langsung dari resource internal PyQt5 agar tidak diblokir protokol HTTP."""
+    """Membaca qwebchannel.js langsung dari resource internal PyQt5."""
     qfile = QFile(":/qtwebchannel/qwebchannel.js")
     if qfile.open(QIODevice.ReadOnly):
         content = bytes(qfile.readAll()).decode("utf-8", errors="ignore")
         qfile.close()
         return content
     return ""
+
 
 class HoldToTalkRecorder:
     def __init__(self):
@@ -86,7 +89,14 @@ class HoldToTalkRecorder:
                 pass
             return
 
-        # 5. Pesan Teks dari Mode Chatbot (Total Mute)
+        # 5. Perintah Personal Intelligence (Custom Personality dari User)
+        if payload.startswith("CUSTOM_PROMPT:"):
+            custom_text = payload[len("CUSTOM_PROMPT:"):].strip()
+            if main_input_queue:
+                main_input_queue.put(f"[SYS_CUSTOM_PROMPT:{custom_text}]")
+            return
+
+        # 6. Pesan Teks dari Mode Chatbot (Total Mute)
         if payload.startswith("CHAT:"):
             chat_text = payload[5:].strip()
             if chat_text and main_input_queue:
@@ -96,7 +106,7 @@ class HoldToTalkRecorder:
                 main_input_queue.put(f"[TEACH_INPUT] {chat_text}")
             return
 
-        # 6. Rekaman Suara Push-to-Talk pada Avatar Blob (Hanya di Mode Live)
+        # 7. Rekaman Suara Push-to-Talk pada Avatar Blob (Hanya di Mode Live)
         if ui_submode == "chat" or self.is_recording:
             return
         self.lang = payload
@@ -129,7 +139,9 @@ class HoldToTalkRecorder:
     def stop_recording(self):
         self.is_recording = False
 
+
 ptt_recorder = HoldToTalkRecorder()
+
 
 def handle_teach_mode(user_input: str, bridge):
     """Menangani input selama aplikasi Tuzi 1.0 berjalan."""
@@ -154,10 +166,11 @@ def handle_teach_mode(user_input: str, bridge):
             f"\n\n[SYSTEM INFO - LANGUAGE TUTOR ACTIVE (Target Language: {target_lang}): "
             "1. If Zak's grammar or phrasing is unnatural, briefly correct it first. "
             "2. Reply naturally to keep the practice conversation going OR give him a short phrase to repeat. "
-            "3. Stay in character and keep your reply under 20 words!]"
+            "3. Keep your persona and keep your reply under 20 words!]"
         )
 
     return user_input
+
 
 def apply_window_state(window, active: bool):
     """Mengatur ukuran jendela ke 1600x900 di tengah layar."""
@@ -180,14 +193,14 @@ def apply_window_state(window, active: bool):
         window.move(QPoint(right_x, right_y))
         window.webview.page().runJavaScript("if(window.setTeachModeUI) setTeachModeUI(false);")
 
+
 def get_ui_injection_js() -> str:
-    """Menyuntikkan qwebchannel.js secara inline beserta UI Light/Dark Mode & Gender Swap."""
+    """Menyuntikkan UI dengan Gemini-Style Settings Popover Menu & Personal Intelligence."""
     qwebchannel_code = get_qwebchannel_js()
     ui_code = """
     (function() {
         if (document.getElementById('tuzi-teach-overlay')) return;
 
-        // Koneksi langsung QWebChannel tanpa terblokir protokol HTTP -> QRC
         function connectPyBridge() {
             if (typeof QWebChannel !== 'undefined' && typeof qt !== 'undefined' && qt.webChannelTransport) {
                 new QWebChannel(qt.webChannelTransport, function(channel) {
@@ -290,9 +303,7 @@ def get_ui_injection_js() -> str:
                 z-index: 999995;
                 outline: none;
             }
-            #tuzi-burger-btn:hover {
-                transform: scale(1.05);
-            }
+            #tuzi-burger-btn:hover { transform: scale(1.05); }
             body.teach-mode-active.dark-mode #tuzi-burger-btn {
                 background: #181B24;
                 color: #FFFFFF;
@@ -319,27 +330,15 @@ def get_ui_injection_js() -> str:
                 z-index: 999995;
                 outline: none;
             }
-            #tuzi-theme-btn:hover {
-                transform: scale(1.06);
-            }
+            #tuzi-theme-btn:hover { transform: scale(1.06); }
             body.teach-mode-active.dark-mode #tuzi-theme-btn {
                 background: #232836;
                 border-color: #3B4259;
             }
-            #tuzi-theme-btn .sun-icon {
-                display: none;
-                color: #FFFFFF;
-            }
-            #tuzi-theme-btn .moon-icon {
-                display: block;
-                color: #FFFFFF;
-            }
-            body.teach-mode-active.dark-mode #tuzi-theme-btn .sun-icon {
-                display: block;
-            }
-            body.teach-mode-active.dark-mode #tuzi-theme-btn .moon-icon {
-                display: none;
-            }
+            #tuzi-theme-btn .sun-icon { display: none; color: #FFFFFF; }
+            #tuzi-theme-btn .moon-icon { display: block; color: #FFFFFF; }
+            body.teach-mode-active.dark-mode #tuzi-theme-btn .sun-icon { display: block; }
+            body.teach-mode-active.dark-mode #tuzi-theme-btn .moon-icon { display: none; }
 
             /* === PANGGUNG AVATAR AI BLOB (MALE = BIRU, FEMALE = PINK) === */
             #ai-blob-stage {
@@ -368,16 +367,9 @@ def get_ui_injection_js() -> str:
                 transition: all 0.25s ease;
                 pointer-events: none;
             }
-            body.teach-mode-active.dark-mode #blob-ptt-hint {
-                color: #9CA3AF;
-            }
-            #ai-blob-stage.listening #blob-ptt-hint {
-                color: #3F49CC;
-                opacity: 0.9;
-            }
-            body.female-avatar #ai-blob-stage.listening #blob-ptt-hint {
-                color: #EC4899;
-            }
+            body.teach-mode-active.dark-mode #blob-ptt-hint { color: #9CA3AF; }
+            #ai-blob-stage.listening #blob-ptt-hint { color: #3F49CC; opacity: 0.9; }
+            body.female-avatar #ai-blob-stage.listening #blob-ptt-hint { color: #EC4899; }
 
             #ai-blob-wrapper {
                 position: relative;
@@ -427,17 +419,11 @@ def get_ui_injection_js() -> str:
                 pointer-events: none;
             }
             .blob-lobe.left {
-                width: 96px;
-                height: 82px;
-                bottom: 24px;
-                left: -28px;
+                width: 96px; height: 82px; bottom: 24px; left: -28px;
                 border-radius: 55% 45% 50% 50%;
             }
             .blob-lobe.right {
-                width: 78px;
-                height: 70px;
-                bottom: 36px;
-                right: -18px;
+                width: 78px; height: 70px; bottom: 36px; right: -18px;
                 border-radius: 45% 55% 50% 50%;
             }
 
@@ -453,8 +439,7 @@ def get_ui_injection_js() -> str:
             }
 
             #ai-blob-wrapper.listening #ai-blob-body {
-                width: 242px;
-                height: 222px;
+                width: 242px; height: 222px;
                 border-radius: 54% 46% 45% 55% / 58% 52% 48% 42%;
                 transform: rotate(-10deg) scale(1.06);
                 box-shadow:
@@ -472,18 +457,14 @@ def get_ui_injection_js() -> str:
             }
 
             #ai-blob-wrapper.listening .blob-lobe.left {
-                opacity: 1;
-                transform: scale(1) translate(-6px, 4px) rotate(-14deg);
+                opacity: 1; transform: scale(1) translate(-6px, 4px) rotate(-14deg);
             }
             #ai-blob-wrapper.listening .blob-lobe.right {
-                opacity: 1;
-                transform: scale(1) translate(6px, 2px) rotate(12deg);
+                opacity: 1; transform: scale(1) translate(6px, 2px) rotate(12deg);
             }
 
             .blob-eyes-container {
-                display: flex;
-                align-items: center;
-                justify-content: center;
+                display: flex; align-items: center; justify-content: center;
                 transform: translate(12px, -16px);
                 transition: transform 0.28s cubic-bezier(0.25, 1, 0.5, 1);
                 pointer-events: none;
@@ -493,76 +474,41 @@ def get_ui_injection_js() -> str:
             }
 
             .blob-eye {
-                width: 24px;
-                height: 54px;
-                background: #F4F6FF;
-                border-radius: 999px;
-                margin: 0 11px;
+                width: 24px; height: 54px;
+                background: #F4F6FF; border-radius: 999px; margin: 0 11px;
                 box-shadow: 0 2px 10px rgba(15, 20, 80, 0.25);
-                transition:
-                    height 0.18s ease,
-                    width 0.18s ease,
-                    border-radius 0.2s ease,
-                    transform 0.2s ease;
+                transition: height 0.18s ease, width 0.18s ease, border-radius 0.2s ease, transform 0.2s ease;
             }
-
-            .blob-eyes-container.blink .blob-eye {
-                height: 6px !important;
-            }
-
+            .blob-eyes-container.blink .blob-eye { height: 6px !important; }
             .blob-eyes-container.emo-excited .blob-eye {
-                height: 44px;
-                width: 26px;
-                border-radius: 50% 50% 25% 25%;
-                transform: scaleY(1.08);
+                height: 44px; width: 26px; border-radius: 50% 50% 25% 25%; transform: scaleY(1.08);
             }
             .blob-eyes-container.emo-soft .blob-eye {
-                height: 34px;
-                border-radius: 14px 14px 999px 999px;
-                opacity: 0.92;
+                height: 34px; border-radius: 14px 14px 999px 999px; opacity: 0.92;
             }
             .blob-eyes-container.emo-angry .blob-eye.left-eye {
-                height: 40px;
-                transform: rotate(16deg);
-                border-radius: 6px 20px 16px 16px;
+                height: 40px; transform: rotate(16deg); border-radius: 6px 20px 16px 16px;
             }
             .blob-eyes-container.emo-angry .blob-eye.right-eye {
-                height: 40px;
-                transform: rotate(-16deg);
-                border-radius: 20px 6px 16px 16px;
+                height: 40px; transform: rotate(-16deg); border-radius: 20px 6px 16px 16px;
             }
 
             .blob-ripple {
-                position: absolute;
-                width: 230px;
-                height: 230px;
-                border-radius: 50%;
-                border: 3px solid rgba(88, 101, 242, 0.45);
-                opacity: 0;
-                pointer-events: none;
-                z-index: 1;
+                position: absolute; width: 230px; height: 230px; border-radius: 50%;
+                border: 3px solid rgba(88, 101, 242, 0.45); opacity: 0; pointer-events: none; z-index: 1;
             }
-            body.female-avatar .blob-ripple {
-                border-color: rgba(244, 114, 182, 0.50);
-            }
-            #ai-blob-wrapper.listening .blob-ripple.r1 {
-                animation: rippleOut 1.6s infinite ease-out;
-            }
-            #ai-blob-wrapper.listening .blob-ripple.r2 {
-                animation: rippleOut 1.6s infinite ease-out 0.8s;
-            }
+            body.female-avatar .blob-ripple { border-color: rgba(244, 114, 182, 0.50); }
+            #ai-blob-wrapper.listening .blob-ripple.r1 { animation: rippleOut 1.6s infinite ease-out; }
+            #ai-blob-wrapper.listening .blob-ripple.r2 { animation: rippleOut 1.6s infinite ease-out 0.8s; }
             @keyframes rippleOut {
                 0% { transform: scale(0.95); opacity: 0.85; }
                 100% { transform: scale(1.65); opacity: 0; }
             }
 
             .bubble-particle {
-                position: absolute;
-                border-radius: 50%;
+                position: absolute; border-radius: 50%;
                 background: radial-gradient(circle at 30% 30%, #9BA6FF, #4D59E0);
-                opacity: 0;
-                pointer-events: none;
-                z-index: 4;
+                opacity: 0; pointer-events: none; z-index: 4;
             }
             body.female-avatar .bubble-particle {
                 background: radial-gradient(circle at 30% 30%, #FBCFE8, #EC4899);
@@ -586,108 +532,204 @@ def get_ui_injection_js() -> str:
                 box-shadow: 10px 0 30px rgba(0, 0, 0, 0.08);
                 display: flex;
                 flex-direction: column;
+                justify-content: space-between;
                 padding: 22px 18px;
                 box-sizing: border-box;
                 transform: translateX(-105%);
                 transition: transform 0.25s cubic-bezier(0.25, 1, 0.5, 1), background 0.3s ease;
-                z-index: 999999;
+                z-index: 999998;
             }
             body.teach-mode-active.dark-mode #tuzi-sidebar {
                 background: #12151E;
                 color: #F3F4F6;
                 border-right-color: #262B3C;
             }
-            #tuzi-sidebar.open {
-                transform: translateX(0);
-            }
+            #tuzi-sidebar.open { transform: translateX(0); }
 
-            .sidebar-header {
+            .sidebar-top-section {
                 display: flex;
-                align-items: center;
-                justify-content: space-between;
-                margin-bottom: 20px;
-                padding: 0 4px;
+                flex-direction: column;
+            }
+            .sidebar-header {
+                display: flex; align-items: center; justify-content: space-between;
+                margin-bottom: 20px; padding: 0 4px;
             }
             .sidebar-brand {
-                display: flex;
-                align-items: center;
-                font-size: 20px;
-                font-weight: 900;
-                color: inherit;
-                letter-spacing: 0.8px;
+                display: flex; align-items: center; font-size: 20px; font-weight: 900;
+                color: inherit; letter-spacing: 0.8px;
             }
             .sidebar-brand svg { margin-right: 10px; }
             .sidebar-collapse-btn {
-                width: 34px;
-                height: 34px;
-                border-radius: 8px;
-                background: transparent;
-                color: inherit;
-                border: none;
-                cursor: pointer;
-                display: flex;
-                align-items: center;
-                justify-content: center;
+                width: 34px; height: 34px; border-radius: 8px; background: transparent;
+                color: inherit; border: none; cursor: pointer; display: flex;
+                align-items: center; justify-content: center;
             }
             .sidebar-collapse-btn:hover { background: rgba(128,128,128,0.12); }
 
             .mode-switch-pill {
-                display: flex;
-                background: #F2F2F2;
-                border: 1.5px solid #E0E0E0;
-                border-radius: 999px;
-                padding: 4px;
-                margin-bottom: 24px;
+                display: flex; background: #F2F2F2; border: 1.5px solid #E0E0E0;
+                border-radius: 999px; padding: 4px; margin-bottom: 24px;
             }
             body.teach-mode-active.dark-mode .mode-switch-pill {
-                background: #1C202E;
-                border-color: #2E3448;
+                background: #1C202E; border-color: #2E3448;
             }
             .mode-tab-btn {
+                flex: 1; height: 36px; border: none; border-radius: 999px;
+                background: transparent; color: #6B7280; font-size: 13.5px; font-weight: 700;
+                cursor: pointer; display: flex; align-items: center; justify-content: center;
+                transition: all 0.2s ease; outline: none;
+            }
+            .mode-tab-btn.active {
+                background: #0D0D0D; color: #FFFFFF; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+            }
+            body.teach-mode-active.dark-mode .mode-tab-btn.active {
+                background: #FFFFFF; color: #0D0D0D;
+            }
+            .live-badge {
+                font-size: 9px; font-weight: 800; padding: 2px 5px;
+                border-radius: 6px; background: rgba(128, 128, 128, 0.25); margin-left: 6px;
+            }
+
+            .sidebar-menu-list { display: flex; flex-direction: column; }
+            .sidebar-item {
+                display: flex; align-items: center; height: 44px; padding: 0 12px;
+                margin-bottom: 6px; border-radius: 12px; background: transparent;
+                color: inherit; border: none; font-size: 14px; font-weight: 600;
+                cursor: pointer; text-align: left; transition: background 0.15s ease; outline: none;
+            }
+            .sidebar-item svg { margin-right: 14px; }
+            .sidebar-item:hover { background: rgba(128, 128, 128, 0.12); }
+            .sidebar-section-label {
+                font-size: 12px; font-weight: 700; color: #777777;
+                margin: 18px 0 8px 12px; text-transform: uppercase; letter-spacing: 0.6px;
+            }
+
+            /* Footer Sidebar dengan Tombol Gear Settings ala Gemini */
+            .sidebar-footer {
+                padding-top: 12px;
+                border-top: 1px solid rgba(128, 128, 128, 0.18);
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+            }
+            #menu-open-settings {
+                width: 100%;
+                margin-bottom: 0;
+                justify-content: space-between;
+            }
+            .settings-left-wrap {
+                display: flex;
+                align-items: center;
+            }
+
+            /* === GEMINI-STYLE SETTINGS POPOVER MENU LIST === */
+            #tuzi-settings-popover {
+                pointer-events: auto;
+                display: none;
+                position: fixed;
+                bottom: 24px;
+                left: 292px;
+                width: 310px;
+                background: #1E1F22;
+                color: #E3E3E3;
+                border: 1px solid #33353A;
+                border-radius: 20px;
+                padding: 14px 12px;
+                box-shadow: 0 16px 45px rgba(0, 0, 0, 0.38);
+                flex-direction: column;
+                z-index: 9999999;
+                box-sizing: border-box;
+                animation: popFadeIn 0.18s ease-out;
+            }
+            body.teach-mode-active:not(.dark-mode) #tuzi-settings-popover {
+                background: #FFFFFF;
+                color: #1F1F1F;
+                border: 2px solid #0D0D0D;
+                box-shadow: 0 16px 40px rgba(0, 0, 0, 0.16);
+            }
+            #tuzi-settings-popover.open {
+                display: flex;
+            }
+            @keyframes popFadeIn {
+                from { opacity: 0; transform: translateY(8px) scale(0.97); }
+                to { opacity: 1; transform: translateY(0) scale(1); }
+            }
+
+            .popover-section-title {
+                font-size: 12px;
+                font-weight: 700;
+                color: #8E918F;
+                padding: 6px 12px 8px 12px;
+                letter-spacing: 0.3px;
+            }
+            .popover-divider {
+                height: 1px;
+                background: rgba(128, 128, 128, 0.2);
+                margin: 8px 6px;
+            }
+
+            /* Blok Swap Gender di Dalam Menu List Settings */
+            .popover-gender-box {
+                padding: 6px 10px 10px 10px;
+            }
+            .gender-switch-container {
+                display: flex;
+                background: rgba(128, 128, 128, 0.14);
+                padding: 4px;
+                border-radius: 999px;
+            }
+            .gender-switch-btn {
                 flex: 1;
                 height: 36px;
                 border: none;
                 border-radius: 999px;
-                background: transparent;
-                color: #6B7280;
-                font-size: 13.5px;
-                font-weight: 700;
+                font-size: 13px;
+                font-weight: 800;
                 cursor: pointer;
-                display: flex;
-                align-items: center;
-                justify-content: center;
+                background: transparent;
+                color: inherit;
+                opacity: 0.7;
                 transition: all 0.2s ease;
                 outline: none;
             }
-            .mode-tab-btn.active {
-                background: #0D0D0D;
+            .gender-switch-btn.male-btn.active {
+                opacity: 1;
+                background: #3B82F6;
                 color: #FFFFFF;
-                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+                box-shadow: 0 3px 10px rgba(59, 130, 246, 0.35);
             }
-            body.teach-mode-active.dark-mode .mode-tab-btn.active {
-                background: #FFFFFF;
-                color: #0D0D0D;
-            }
-            .live-badge {
-                font-size: 9px;
-                font-weight: 800;
-                padding: 2px 5px;
-                border-radius: 6px;
-                background: rgba(128, 128, 128, 0.25);
-                margin-left: 6px;
+            .gender-switch-btn.female-btn.active {
+                opacity: 1;
+                background: #F9A8D4;
+                color: #831843;
+                box-shadow: 0 3px 10px rgba(244, 114, 182, 0.40);
             }
 
-            .sidebar-menu-list {
-                display: flex;
+            #female-voice-options {
+                display: none;
                 flex-direction: column;
+                margin-top: 8px;
             }
-            .sidebar-item {
+            #female-voice-options.show { display: flex; }
+            .fmode-row { display: flex; justify-content: space-between; }
+            .fmode-btn {
+                flex: 1; height: 32px; margin: 0 3px; border-radius: 10px;
+                border: 1px solid rgba(128, 128, 128, 0.3); background: transparent;
+                color: inherit; font-size: 11.5px; font-weight: 700; cursor: pointer;
+            }
+            .fmode-btn.active {
+                background: #F472B6; color: #FFFFFF; border-color: #F472B6;
+            }
+
+            /* Item Menu List di Popover Settings (Gaya Gemini) */
+            .popover-menu-item {
                 display: flex;
                 align-items: center;
+                justify-content: space-between;
+                width: 100%;
                 height: 44px;
                 padding: 0 12px;
-                margin-bottom: 6px;
-                border-radius: 12px;
+                border-radius: 999px;
                 background: transparent;
                 color: inherit;
                 border: none;
@@ -695,22 +737,37 @@ def get_ui_injection_js() -> str:
                 font-weight: 600;
                 cursor: pointer;
                 text-align: left;
-                transition: background 0.15s ease;
+                transition: background 0.15s ease, border-color 0.15s ease;
+                box-sizing: border-box;
                 outline: none;
             }
-            .sidebar-item svg { margin-right: 14px; }
-            .sidebar-item:hover { background: rgba(128, 128, 128, 0.12); }
-            .sidebar-section-label {
-                font-size: 12px;
-                font-weight: 700;
-                color: #777777;
-                margin: 18px 0 8px 12px;
-                text-transform: uppercase;
-                letter-spacing: 0.6px;
+            .popover-menu-item:hover {
+                background: rgba(128, 128, 128, 0.14);
             }
+            .popover-menu-item.highlighted {
+                border: 1.5px solid currentColor;
+            }
+            .popover-item-left {
+                display: flex;
+                align-items: center;
+            }
+            .popover-item-left svg {
+                margin-right: 14px;
+                opacity: 0.9;
+            }
+            .pi-status-dot {
+                font-size: 10px;
+                font-weight: 800;
+                padding: 2px 7px;
+                border-radius: 999px;
+                background: rgba(59, 130, 246, 0.2);
+                color: #3B82F6;
+                display: none;
+            }
+            .pi-status-dot.active { display: inline-block; }
 
-            /* === MODAL SETTINGS (GENDER SWAP MALE BIRU / FEMALE PINK MUDA) === */
-            #tuzi-settings-modal {
+            /* === MODAL PERSONAL INTELLIGENCE (KOLOM CUSTOM PERSONALITY) === */
+            #tuzi-pi-modal {
                 pointer-events: auto;
                 display: none;
                 position: fixed;
@@ -718,121 +775,108 @@ def get_ui_injection_js() -> str:
                 left: 0;
                 width: 100vw;
                 height: 100vh;
-                background: rgba(0, 0, 0, 0.45);
+                background: rgba(0, 0, 0, 0.48);
                 align-items: center;
                 justify-content: center;
-                z-index: 9999999;
+                z-index: 10000000;
             }
-            #tuzi-settings-modal.open {
-                display: flex;
-            }
-            .settings-card {
-                width: 400px;
+            #tuzi-pi-modal.open { display: flex; }
+
+            .pi-card {
+                width: 520px;
                 background: #FFFFFF;
                 color: #0D0D0D;
                 border: 2.5px solid #0D0D0D;
                 border-radius: 24px;
-                padding: 24px 26px;
-                box-shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
+                padding: 26px 28px;
+                box-shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
                 box-sizing: border-box;
+                display: flex;
+                flex-direction: column;
             }
-            body.teach-mode-active.dark-mode .settings-card {
+            body.teach-mode-active.dark-mode .pi-card {
                 background: #161925;
-                color: #FFFFFF;
+                color: #F3F4F6;
                 border-color: #32394E;
             }
-            .settings-header {
+            .pi-header {
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
-                margin-bottom: 20px;
+                margin-bottom: 8px;
             }
-            .settings-title {
+            .pi-title-wrap {
+                display: flex;
+                align-items: center;
                 font-size: 18px;
                 font-weight: 800;
             }
-            .settings-close {
-                background: transparent;
-                color: inherit;
-                border: none;
-                font-size: 20px;
-                font-weight: bold;
-                cursor: pointer;
+            .pi-title-wrap svg { margin-right: 10px; }
+            .pi-close-btn {
+                background: transparent; color: inherit; border: none;
+                font-size: 20px; font-weight: bold; cursor: pointer;
             }
-            .settings-label {
-                font-size: 12.5px;
-                font-weight: 700;
+            .pi-desc {
+                font-size: 13.5px;
                 color: #6B7280;
-                margin-bottom: 10px;
-                text-transform: uppercase;
-                letter-spacing: 0.6px;
+                line-height: 1.45;
+                margin-bottom: 16px;
             }
+            body.teach-mode-active.dark-mode .pi-desc { color: #9CA3AF; }
 
-            .gender-switch-container {
-                display: flex;
-                background: #F1F5F9;
-                padding: 5px;
-                border-radius: 999px;
-                border: 1.5px solid #E2E8F0;
-                margin-bottom: 20px;
-            }
-            body.teach-mode-active.dark-mode .gender-switch-container {
-                background: #0F121A;
-                border-color: #262C3D;
-            }
-            .gender-switch-btn {
-                flex: 1;
-                height: 44px;
-                border: none;
-                border-radius: 999px;
+            #pi-prompt-input {
+                width: 100%;
+                height: 120px;
+                border: 2px solid #0D0D0D;
+                border-radius: 16px;
+                padding: 12px 14px;
                 font-size: 14px;
-                font-weight: 800;
-                cursor: pointer;
-                background: transparent;
-                color: #64748B;
-                transition: all 0.25s ease;
+                font-family: inherit;
+                color: #0D0D0D;
+                background: #F9FAFB;
+                resize: none;
                 outline: none;
+                box-sizing: border-box;
+                margin-bottom: 14px;
             }
-            .gender-switch-btn.male-btn.active {
-                background: #3B82F6;
+            body.teach-mode-active.dark-mode #pi-prompt-input {
+                background: #0F121B;
                 color: #FFFFFF;
-                box-shadow: 0 4px 14px rgba(59, 130, 246, 0.40);
+                border-color: #2E354B;
             }
-            .gender-switch-btn.female-btn.active {
-                background: #F9A8D4;
-                color: #831843;
-                box-shadow: 0 4px 14px rgba(244, 114, 182, 0.45);
+            #pi-prompt-input:focus {
+                border-color: #3B82F6;
             }
 
-            #female-voice-options {
-                display: none;
-                flex-direction: column;
-                margin-top: 6px;
-            }
-            #female-voice-options.show {
-                display: flex;
-            }
-            .fmode-row {
+            .pi-actions {
                 display: flex;
                 justify-content: space-between;
+                align-items: center;
             }
-            .fmode-btn {
-                flex: 1;
-                height: 38px;
-                margin: 0 4px;
+            .pi-btn-reset {
+                height: 40px;
+                padding: 0 16px;
                 border-radius: 12px;
-                border: 1.5px solid #E2E8F0;
+                border: 1.5px solid #D1D5DB;
                 background: transparent;
                 color: inherit;
-                font-size: 12.5px;
+                font-size: 13px;
                 font-weight: 700;
                 cursor: pointer;
-                transition: all 0.2s ease;
             }
-            .fmode-btn.active {
-                background: #F472B6;
+            .pi-btn-save {
+                height: 40px;
+                padding: 0 22px;
+                border-radius: 12px;
+                border: none;
+                background: #0D0D0D;
                 color: #FFFFFF;
-                border-color: #F472B6;
+                font-size: 13.5px;
+                font-weight: 800;
+                cursor: pointer;
+            }
+            body.teach-mode-active.dark-mode .pi-btn-save {
+                background: #3B82F6;
             }
 
             /* === TAMPILAN CHATBOT (TOTAL MUTE MODE) === */
@@ -852,199 +896,90 @@ def get_ui_injection_js() -> str:
                 box-sizing: border-box;
                 z-index: 999993;
             }
-            body.teach-mode-active.dark-mode #tuzi-chat-view {
-                background: #0B0D13;
-            }
-            body.teach-mode-active.chat-tab-open #tuzi-chat-view {
-                display: flex;
-            }
-            body.teach-mode-active.chat-tab-open .discord-call-wrapper {
-                display: none !important;
-            }
+            body.teach-mode-active.dark-mode #tuzi-chat-view { background: #0B0D13; }
+            body.teach-mode-active.chat-tab-open #tuzi-chat-view { display: flex; }
+            body.teach-mode-active.chat-tab-open .discord-call-wrapper { display: none !important; }
 
             .chat-top-bar {
-                width: 100%;
-                max-width: 820px;
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                padding-bottom: 14px;
-                border-bottom: 1.5px solid #EBEBEB;
+                width: 100%; max-width: 820px; display: flex; align-items: center;
+                justify-content: space-between; padding-bottom: 14px; border-bottom: 1.5px solid #EBEBEB;
             }
-            body.teach-mode-active.dark-mode .chat-top-bar {
-                border-bottom-color: #222634;
-            }
-            .chat-top-title {
-                font-size: 16px;
-                font-weight: 800;
-                color: #0D0D0D;
-                letter-spacing: 0.5px;
-            }
-            body.teach-mode-active.dark-mode .chat-top-title {
-                color: #FFFFFF;
-            }
+            body.teach-mode-active.dark-mode .chat-top-bar { border-bottom-color: #222634; }
+            .chat-top-title { font-size: 16px; font-weight: 800; color: #0D0D0D; letter-spacing: 0.5px; }
+            body.teach-mode-active.dark-mode .chat-top-title { color: #FFFFFF; }
 
             #tuzi-chat-messages {
-                width: 100%;
-                max-width: 820px;
-                flex: 1;
-                overflow-y: auto;
-                padding: 24px 8px;
-                display: flex;
-                flex-direction: column;
-                box-sizing: border-box;
+                width: 100%; max-width: 820px; flex: 1; overflow-y: auto;
+                padding: 24px 8px; display: flex; flex-direction: column; box-sizing: border-box;
             }
-            .chat-bubble-row {
-                display: flex;
-                width: 100%;
-                margin-bottom: 16px;
-            }
+            .chat-bubble-row { display: flex; width: 100%; margin-bottom: 16px; }
             .chat-bubble-row.user { justify-content: flex-end; }
             .chat-bubble-row.bot { justify-content: flex-start; }
             .chat-bubble {
-                max-width: 72%;
-                padding: 13px 18px;
-                border-radius: 18px;
-                font-size: 15px;
-                font-weight: 500;
-                line-height: 1.5;
-                word-wrap: break-word;
+                max-width: 72%; padding: 13px 18px; border-radius: 18px;
+                font-size: 15px; font-weight: 500; line-height: 1.5; word-wrap: break-word;
             }
             .chat-bubble-row.user .chat-bubble {
-                background: #0D0D0D;
-                color: #FFFFFF;
-                border-bottom-right-radius: 4px;
+                background: #0D0D0D; color: #FFFFFF; border-bottom-right-radius: 4px;
             }
-            body.teach-mode-active.dark-mode .chat-bubble-row.user .chat-bubble {
-                background: #3B82F6;
-            }
+            body.teach-mode-active.dark-mode .chat-bubble-row.user .chat-bubble { background: #3B82F6; }
             .chat-bubble-row.bot .chat-bubble {
-                background: #F7F7F7;
-                color: #0D0D0D;
-                border: 1.5px solid #0D0D0D;
-                border-bottom-left-radius: 4px;
+                background: #F7F7F7; color: #0D0D0D; border: 1.5px solid #0D0D0D; border-bottom-left-radius: 4px;
             }
             body.teach-mode-active.dark-mode .chat-bubble-row.bot .chat-bubble {
-                background: #181C28;
-                color: #F3F4F6;
-                border-color: #2E3446;
+                background: #181C28; color: #F3F4F6; border-color: #2E3446;
             }
 
             .chat-input-bar {
-                width: 100%;
-                max-width: 820px;
-                display: flex;
-                align-items: center;
-                background: #FFFFFF;
-                border: 2px solid #0D0D0D;
-                border-radius: 20px;
-                padding: 8px 12px 8px 20px;
-                box-sizing: border-box;
+                width: 100%; max-width: 820px; display: flex; align-items: center;
+                background: #FFFFFF; border: 2px solid #0D0D0D; border-radius: 20px;
+                padding: 8px 12px 8px 20px; box-sizing: border-box;
             }
             body.teach-mode-active.dark-mode .chat-input-bar {
-                background: #151822;
-                border-color: #2E3446;
+                background: #151822; border-color: #2E3446;
             }
             #tuzi-chat-input {
-                flex: 1;
-                border: none;
-                outline: none;
-                background: transparent;
-                color: inherit;
-                font-size: 15px;
-                font-weight: 500;
-                font-family: inherit;
+                flex: 1; border: none; outline: none; background: transparent;
+                color: inherit; font-size: 15px; font-weight: 500; font-family: inherit;
             }
-            body.teach-mode-active.dark-mode #tuzi-chat-input {
-                color: #FFFFFF;
-            }
+            body.teach-mode-active.dark-mode #tuzi-chat-input { color: #FFFFFF; }
             #tuzi-chat-send {
-                width: 42px;
-                height: 42px;
-                border-radius: 14px;
-                background: #0D0D0D;
-                color: #FFFFFF;
-                border: none;
-                cursor: pointer;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                margin-left: 10px;
+                width: 42px; height: 42px; border-radius: 14px; background: #0D0D0D;
+                color: #FFFFFF; border: none; cursor: pointer; display: flex;
+                align-items: center; justify-content: center; margin-left: 10px;
             }
-            body.teach-mode-active.dark-mode #tuzi-chat-send {
-                background: #3B82F6;
-            }
+            body.teach-mode-active.dark-mode #tuzi-chat-send { background: #3B82F6; }
 
             /* === BOTTOM DOCK === */
             .discord-call-wrapper {
-                pointer-events: auto;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                margin-bottom: 34px;
-                margin-top: auto;
-                z-index: 10;
+                pointer-events: auto; display: flex; align-items: center;
+                justify-content: center; margin-bottom: 34px; margin-top: auto; z-index: 10;
             }
-            .discord-call-wrapper > * {
-                margin: 0 10px !important;
-            }
-
+            .discord-call-wrapper > * { margin: 0 10px !important; }
             .discord-dock {
-                display: flex;
-                align-items: center;
-                background: #111214;
-                padding: 8px 10px;
-                border-radius: 20px;
+                display: flex; align-items: center; background: #111214;
+                padding: 8px 10px; border-radius: 20px;
                 box-shadow: 0 12px 32px rgba(0, 0, 0, 0.25);
                 border: 1px solid rgba(255, 255, 255, 0.08);
             }
-
             .lang-btn {
-                height: 52px;
-                min-width: 58px;
-                padding: 0 18px;
-                margin: 0 4px;
-                background: transparent;
-                color: #B5BAC1;
-                border: none;
-                border-radius: 14px;
-                font-size: 14px;
-                font-weight: 800;
-                cursor: pointer;
-                transition: all 0.15s ease;
+                height: 52px; min-width: 58px; padding: 0 18px; margin: 0 4px;
+                background: transparent; color: #B5BAC1; border: none; border-radius: 14px;
+                font-size: 14px; font-weight: 800; cursor: pointer; transition: all 0.15s ease;
             }
-            .lang-btn:hover {
-                background: #2B2D31;
-                color: #DBDEE1;
-            }
+            .lang-btn:hover { background: #2B2D31; color: #DBDEE1; }
             .lang-btn.active {
-                background: #FFFFFF;
-                color: #0D0D0D;
-                box-shadow: 0 3px 10px rgba(0, 0, 0, 0.25);
+                background: #FFFFFF; color: #0D0D0D; box-shadow: 0 3px 10px rgba(0, 0, 0, 0.25);
             }
-
             .hangup-btn {
-                width: 78px;
-                height: 68px;
-                background: #DA373C;
-                color: #FFFFFF;
-                border: none;
-                border-radius: 20px;
-                cursor: pointer;
-                display: flex;
-                align-items: center;
-                justify-content: center;
+                width: 78px; height: 68px; background: #DA373C; color: #FFFFFF;
+                border: none; border-radius: 20px; cursor: pointer; display: flex;
+                align-items: center; justify-content: center;
                 box-shadow: 0 12px 30px rgba(218, 55, 60, 0.35);
-                transition: all 0.15s ease;
-                outline: none;
+                transition: all 0.15s ease; outline: none;
             }
-            .hangup-btn:hover {
-                background: #A12828;
-                transform: scale(1.04);
-            }
-            .hangup-btn:active {
-                transform: scale(0.96);
-            }
+            .hangup-btn:hover { background: #A12828; transform: scale(1.04); }
+            .hangup-btn:active { transform: scale(0.96); }
         `;
         document.head.appendChild(style);
 
@@ -1093,88 +1028,144 @@ def get_ui_injection_js() -> str:
                 </div>
             </div>
 
+            <!-- SIDEBAR KIRI -->
             <div id="tuzi-sidebar">
-                <div class="sidebar-header">
-                    <div class="sidebar-brand">
-                        <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
-                            <path d="M12 2L14.8 9.2L22 12L14.8 14.8L12 22L9.2 14.8L2 12L9.2 9.2L12 2Z"/>
-                        </svg>
-                        <span>TUZI</span>
+                <div class="sidebar-top-section">
+                    <div class="sidebar-header">
+                        <div class="sidebar-brand">
+                            <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+                                <path d="M12 2L14.8 9.2L22 12L14.8 14.8L12 22L9.2 14.8L2 12L9.2 9.2L12 2Z"/>
+                            </svg>
+                            <span>TUZI</span>
+                        </div>
+                        <button class="sidebar-collapse-btn" id="close-sidebar-btn" title="Tutup Menu">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="3" y="3" width="18" height="18" rx="4"></rect>
+                                <line x1="9" y1="3" x2="9" y2="21"></line>
+                            </svg>
+                        </button>
                     </div>
-                    <button class="sidebar-collapse-btn" id="close-sidebar-btn" title="Tutup Menu">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <rect x="3" y="3" width="18" height="18" rx="4"></rect>
-                            <line x1="9" y1="3" x2="9" y2="21"></line>
-                        </svg>
-                    </button>
+
+                    <div class="mode-switch-pill">
+                        <button class="mode-tab-btn" id="tab-btn-chat">Chat</button>
+                        <button class="mode-tab-btn active" id="tab-btn-live">
+                            <span>Live</span>
+                            <span class="live-badge">VOICE</span>
+                        </button>
+                    </div>
+
+                    <div class="sidebar-menu-list">
+                        <button class="sidebar-item" id="menu-new-chat">
+                            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+                                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+                            </svg>
+                            <span>New chat</span>
+                        </button>
+
+                        <button class="sidebar-item" id="menu-search-chat">
+                            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <circle cx="11" cy="11" r="8"></circle>
+                                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                            </svg>
+                            <span>Search chats</span>
+                        </button>
+
+                        <div class="sidebar-section-label">Language Target</div>
+                        <button class="sidebar-item sidebar-lang-shortcut" data-lang="en-US">
+                            <span>🇺🇸 &nbsp;English Practice</span>
+                        </button>
+                        <button class="sidebar-item sidebar-lang-shortcut" data-lang="ja-JP">
+                            <span>🇯🇵 &nbsp;Japanese Practice</span>
+                        </button>
+                        <button class="sidebar-item sidebar-lang-shortcut" data-lang="id-ID">
+                            <span>🇮🇩 &nbsp;Indonesian Practice</span>
+                        </button>
+                    </div>
                 </div>
 
-                <div class="mode-switch-pill">
-                    <button class="mode-tab-btn" id="tab-btn-chat">Chat</button>
-                    <button class="mode-tab-btn active" id="tab-btn-live">
-                        <span>Live</span>
-                        <span class="live-badge">VOICE</span>
-                    </button>
-                </div>
-
-                <div class="sidebar-menu-list">
-                    <button class="sidebar-item" id="menu-new-chat">
-                        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
-                            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
-                        </svg>
-                        <span>New chat</span>
-                    </button>
-
-                    <button class="sidebar-item" id="menu-search-chat">
-                        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <circle cx="11" cy="11" r="8"></circle>
-                            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-                        </svg>
-                        <span>Search chats</span>
-                    </button>
-
-                    <button class="sidebar-item" id="menu-open-settings">
-                        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <circle cx="12" cy="12" r="3"></circle>
-                            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-                        </svg>
-                        <span>Settings</span>
-                    </button>
-
-                    <div class="sidebar-section-label">Language Target</div>
-                    <button class="sidebar-item sidebar-lang-shortcut" data-lang="en-US">
-                        <span>🇺🇸 &nbsp;English Practice</span>
-                    </button>
-                    <button class="sidebar-item sidebar-lang-shortcut" data-lang="ja-JP">
-                        <span>🇯🇵 &nbsp;Japanese Practice</span>
-                    </button>
-                    <button class="sidebar-item sidebar-lang-shortcut" data-lang="id-ID">
-                        <span>🇮🇩 &nbsp;Indonesian Practice</span>
+                <!-- Tombol Settings di Bawah Sidebar -->
+                <div class="sidebar-footer">
+                    <button class="sidebar-item" id="menu-open-settings" title="Buka Menu Settings">
+                        <div class="settings-left-wrap">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <circle cx="12" cy="12" r="3"></circle>
+                                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                            </svg>
+                            <span>Settings</span>
+                        </div>
                     </button>
                 </div>
             </div>
 
-            <div id="tuzi-settings-modal">
-                <div class="settings-card">
-                    <div class="settings-header">
-                        <div class="settings-title">Settings</div>
-                        <button class="settings-close" id="close-settings-btn">✕</button>
-                    </div>
-
-                    <div class="settings-label">AI Companion Gender & Voice</div>
+            <!-- GEMINI-STYLE SETTINGS POPOVER LIST MENU -->
+            <div id="tuzi-settings-popover">
+                <div class="popover-section-title">Swap Gender & Voice</div>
+                <div class="popover-gender-box">
                     <div class="gender-switch-container">
                         <button class="gender-switch-btn male-btn active" id="btn-gender-male">♂ Male</button>
                         <button class="gender-switch-btn female-btn" id="btn-gender-female">♀ Female</button>
                     </div>
-
                     <div id="female-voice-options">
-                        <div class="settings-label">Female Personality Type</div>
                         <div class="fmode-row">
                             <button class="fmode-btn active" data-fmode="1">Dandere</button>
                             <button class="fmode-btn" data-fmode="2">Shy</button>
                             <button class="fmode-btn" data-fmode="3">Mommy</button>
                         </div>
+                    </div>
+                </div>
+
+                <div class="popover-divider"></div>
+                <div class="popover-section-title">Preferences</div>
+
+                <!-- Tombol Personal Intelligence di Bawah Swap Gender -->
+                <button class="popover-menu-item" id="btn-open-pi">
+                    <div class="popover-item-left">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path>
+                            <circle cx="9" cy="7" r="4"></circle>
+                            <path d="M19 8l1.2 2.8L23 12l-2.8 1.2L19 16l-1.2-2.8L15 12l2.8-1.2L19 8z"></path>
+                        </svg>
+                        <span>Personal Intelligence</span>
+                    </div>
+                    <span class="pi-status-dot" id="pi-badge">ON</span>
+                </button>
+
+                <button class="popover-menu-item" id="btn-popover-theme">
+                    <div class="popover-item-left">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="12" cy="12" r="5"></circle>
+                            <line x1="12" y1="1" x2="12" y2="3"></line>
+                            <line x1="12" y1="21" x2="12" y2="23"></line>
+                            <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+                            <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+                        </svg>
+                        <span>Switch Theme</span>
+                    </div>
+                </button>
+            </div>
+
+            <!-- MODAL PERSONAL INTELLIGENCE (KOLOM CUSTOM PERSONALITY) -->
+            <div id="tuzi-pi-modal">
+                <div class="pi-card">
+                    <div class="pi-header">
+                        <div class="pi-title-wrap">
+                            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path>
+                                <circle cx="9" cy="7" r="4"></circle>
+                                <path d="M19 8l1.2 2.8L23 12l-2.8 1.2L19 16l-1.2-2.8L15 12l2.8-1.2L19 8z"></path>
+                            </svg>
+                            <span>Personal Intelligence</span>
+                        </div>
+                        <button class="pi-close-btn" id="close-pi-btn">✕</button>
+                    </div>
+                    <div class="pi-desc">
+                        Atur bebas kepribadian, sikap, atau gaya bicara Tuzi di luar kepribadian bawaan (Contoh: <i>"Jadilah sensei bahasa Jepang yang tegas tapi suka bercanda"</i>).
+                    </div>
+                    <textarea id="pi-prompt-input" placeholder="Tulis kepribadian atau cara bicara chatbot yang kamu inginkan di sini..."></textarea>
+                    <div class="pi-actions">
+                        <button class="pi-btn-reset" id="pi-reset-btn">Reset ke Default</button>
+                        <button class="pi-btn-save" id="pi-save-btn">Simpan Kepribadian</button>
                     </div>
                 </div>
             </div>
@@ -1222,26 +1213,49 @@ def get_ui_injection_js() -> str:
         `;
         document.body.appendChild(overlay);
 
+        let sidebar = document.getElementById('tuzi-sidebar');
+        let burgerBtn = document.getElementById('tuzi-burger-btn');
+        let closeSidebarBtn = document.getElementById('close-sidebar-btn');
+        let settingsPopover = document.getElementById('tuzi-settings-popover');
+        let openSettingsBtn = document.getElementById('menu-open-settings');
         let themeBtn = document.getElementById('tuzi-theme-btn');
-        themeBtn.onclick = () => {
+        let popoverThemeBtn = document.getElementById('btn-popover-theme');
+
+        // Toggle Theme
+        function toggleTheme() {
             document.body.classList.toggle('dark-mode');
+        }
+        themeBtn.onclick = toggleTheme;
+        popoverThemeBtn.onclick = toggleTheme;
+
+        // Buka/Tutup Sidebar & Settings Popover List
+        burgerBtn.onclick = () => {
+            sidebar.classList.add('open');
+        };
+        closeSidebarBtn.onclick = () => {
+            sidebar.classList.remove('open');
+            settingsPopover.classList.remove('open');
+        };
+        openSettingsBtn.onclick = (e) => {
+            e.stopPropagation();
+            settingsPopover.classList.toggle('open');
         };
 
-        let settingsModal = document.getElementById('tuzi-settings-modal');
-        let openSettingsBtn = document.getElementById('menu-open-settings');
-        let closeSettingsBtn = document.getElementById('close-settings-btn');
+        // Tutup Popover jika klik di luar
+        window.addEventListener('mousedown', (e) => {
+            if (
+                settingsPopover.classList.contains('open') &&
+                !settingsPopover.contains(e.target) &&
+                !openSettingsBtn.contains(e.target)
+            ) {
+                settingsPopover.classList.remove('open');
+            }
+        });
+
+        // Swap Gender (Male Biru / Female Pink Muda)
         let btnMale = document.getElementById('btn-gender-male');
         let btnFemale = document.getElementById('btn-gender-female');
         let femaleOptions = document.getElementById('female-voice-options');
-
-        openSettingsBtn.onclick = () => {
-            sidebar.classList.remove('open');
-            settingsModal.classList.add('open');
-        };
-        closeSettingsBtn.onclick = () => settingsModal.classList.remove('open');
-        settingsModal.onclick = (e) => {
-            if (e.target === settingsModal) settingsModal.classList.remove('open');
-        };
 
         btnMale.onclick = () => {
             btnMale.classList.add('active');
@@ -1268,6 +1282,45 @@ def get_ui_injection_js() -> str:
             };
         });
 
+        // --- LOGIKA PERSONAL INTELLIGENCE MODAL ---
+        let piModal = document.getElementById('tuzi-pi-modal');
+        let openPiBtn = document.getElementById('btn-open-pi');
+        let closePiBtn = document.getElementById('close-pi-btn');
+        let piInput = document.getElementById('pi-prompt-input');
+        let piSaveBtn = document.getElementById('pi-save-btn');
+        let piResetBtn = document.getElementById('pi-reset-btn');
+        let piBadge = document.getElementById('pi-badge');
+
+        openPiBtn.onclick = () => {
+            settingsPopover.classList.remove('open');
+            sidebar.classList.remove('open');
+            piModal.classList.add('open');
+            setTimeout(() => piInput.focus(), 80);
+        };
+        closePiBtn.onclick = () => piModal.classList.remove('open');
+        piModal.onclick = (e) => {
+            if (e.target === piModal) piModal.classList.remove('open');
+        };
+
+        piSaveBtn.onclick = () => {
+            let customVal = piInput.value.trim();
+            if (window.pyBridge) {
+                window.pyBridge.start_ptt('CUSTOM_PROMPT:' + customVal);
+            }
+            piBadge.classList.toggle('active', customVal.length > 0);
+            piModal.classList.remove('open');
+        };
+
+        piResetBtn.onclick = () => {
+            piInput.value = '';
+            if (window.pyBridge) {
+                window.pyBridge.start_ptt('CUSTOM_PROMPT:');
+            }
+            piBadge.classList.remove('active');
+            piModal.classList.remove('open');
+        };
+
+        // --- LOGIKA ANIMASI AVATAR BLOB ---
         let blobStage = document.getElementById('ai-blob-stage');
         let blobWrapper = document.getElementById('ai-blob-wrapper');
         let blobBody = document.getElementById('ai-blob-body');
@@ -1350,24 +1403,17 @@ def get_ui_injection_js() -> str:
         blobWrapper.addEventListener('mousedown', startHold);
         window.addEventListener('mouseup', stopHold);
 
-        let sidebar = document.getElementById('tuzi-sidebar');
-        let burgerBtn = document.getElementById('tuzi-burger-btn');
-        let closeSidebarBtn = document.getElementById('close-sidebar-btn');
         let tabChat = document.getElementById('tab-btn-chat');
         let tabLive = document.getElementById('tab-btn-live');
         let chatMessages = document.getElementById('tuzi-chat-messages');
         let chatInput = document.getElementById('tuzi-chat-input');
         let chatSend = document.getElementById('tuzi-chat-send');
 
-        burgerBtn.onclick = () => sidebar.classList.add('open');
-        closeSidebarBtn.onclick = () => sidebar.classList.remove('open');
-
         function switchSubMode(mode) {
             if (mode === 'chat') {
                 tabChat.classList.add('active');
                 tabLive.classList.remove('active');
                 document.body.classList.add('chat-tab-open');
-                // Kosongkan subtitle Live saat masuk ke Chat Mode
                 let subElem = document.getElementById('tuzi-subtitle-box');
                 if (subElem) {
                     subElem.innerHTML = '';
@@ -1382,6 +1428,7 @@ def get_ui_injection_js() -> str:
                 if (window.pyBridge) window.pyBridge.start_ptt('MODE:LIVE');
             }
             sidebar.classList.remove('open');
+            settingsPopover.classList.remove('open');
         }
 
         tabChat.onclick = () => switchSubMode('chat');
@@ -1428,17 +1475,14 @@ def get_ui_injection_js() -> str:
             if (e.key === 'Enter') sendChatMessage();
         });
 
-        // Pisahkan output Chat Mode dan Live Mode
         const origSetSubtitle = window.setSubtitle;
         window.setSubtitle = function(htmlContent) {
             const isChatTab = document.body.classList.contains('chat-tab-open');
             if (isChatTab) {
-                // Jika di Chat Mode: HANYA masukkan ke bubble chat, JANGAN tampilkan di Live subtitle
                 if (htmlContent && htmlContent.trim() !== '') {
                     window.appendTeachChatBubble('bot', htmlContent);
                 }
             } else {
-                // Jika di Live Mode: tampilkan di subtitle bawah avatar
                 if (origSetSubtitle) origSetSubtitle(htmlContent);
                 if (htmlContent && htmlContent.trim() !== '') {
                     window.appendTeachChatBubble('bot', htmlContent);
@@ -1461,10 +1505,10 @@ def get_ui_injection_js() -> str:
             btn.addEventListener('click', () => {
                 setLanguage(btn.getAttribute('data-lang'));
                 sidebar.classList.remove('open');
+                settingsPopover.classList.remove('open');
             });
         });
 
-        // Tombol Hang-up memanggil Python os._exit(0) tanpa menghancurkan QObject terlebih dahulu
         function triggerHangup() {
             if (window.pyBridge) {
                 window.pyBridge.start_ptt('CMD:EXIT');
@@ -1481,6 +1525,7 @@ def get_ui_injection_js() -> str:
                 document.body.classList.remove('teach-mode-active');
                 document.body.classList.remove('chat-tab-open');
                 sidebar.classList.remove('open');
+                settingsPopover.classList.remove('open');
             }
         };
 
