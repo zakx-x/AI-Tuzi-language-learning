@@ -1,10 +1,36 @@
+import io
+import json
 import os
 import re
 import threading
+import wave
+import audioop
 import pygame
 import speech_recognition as sr
 from PyQt5.QtCore import Qt, QPoint, QFile, QIODevice
 from PyQt5.QtWidgets import QApplication, QMainWindow
+
+import config
+
+# Opsional: Modul Noise Suppression (noisereduce & numpy)
+try:
+    import numpy as np
+    import noisereduce as nr
+    HAS_NOISEREDUCE = True
+except ImportError:
+    HAS_NOISEREDUCE = False
+
+# Opsional: Model STT Whisper Large V3 Turbo via Groq
+try:
+    from groq import Groq
+    _groq_key = getattr(config, "GROQ_API_KEY", "")
+    groq_stt_client = (
+        Groq(api_key=_groq_key)
+        if (_groq_key and not _groq_key.startswith("MASUKKAN"))
+        else None
+    )
+except ImportError:
+    groq_stt_client = None
 
 # Langsung aktif sejak aplikasi dijalankan
 is_active = True
@@ -14,6 +40,7 @@ current_gender = "male"      # Default: "male" (Biru) atau "female" (Pink)
 current_female_mode = 1      # 1 = Dandere, 2 = Shy, 3 = Mommy
 custom_personality = ""      # Menyimpan instruksi Personal Intelligence dari user
 target_lang = "en-US"
+selected_mic_index = getattr(config, "MIC_DEVICE_INDEX", None)
 main_input_queue = None
 main_window_ref = None
 
@@ -26,6 +53,69 @@ FULLSCREEN_WIN_HEIGHT = 1080
 # Ukuran Asli Mode Overlay Desktop
 DEFAULT_WIN_WIDTH = 600
 DEFAULT_WIN_HEIGHT = 1300
+
+
+def get_available_microphones() -> list:
+    """Mengambil daftar mikrofon yang terdeteksi di perangkat Windows."""
+    mic_list = []
+    try:
+        names = sr.Microphone.list_microphone_names()
+        for idx, name in enumerate(names):
+            # Saring hanya perangkat input/mic yang relevan
+            lower_n = name.lower()
+            if any(k in lower_n for k in ["output", "speaker", "headphone", "mapper - output"]):
+                continue
+            mic_list.append({"index": idx, "name": name})
+    except Exception as e:
+        print(f"[MIC WARNING] Gagal memuat daftar mikrofon: {e}")
+    return mic_list
+
+
+def clean_voice_audio(raw_pcm: bytes, sample_rate: int = 16000) -> bytes:
+    """
+    Membersihkan rekaman suara dengan Noise Suppression (Spectral Gating)
+    dan Auto-Gain Normalization agar suara manusia terdengar jernih.
+    """
+    if not raw_pcm:
+        return raw_pcm
+
+    try:
+        if HAS_NOISEREDUCE:
+            audio_np = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32)
+
+            # 1. Hilangkan DC Offset
+            audio_np = audio_np - np.mean(audio_np)
+
+            # 2. Jalankan Spectral Gating Noise Suppression (noisereduce)
+            if len(audio_np) > sample_rate * 0.25:
+                reduced_np = nr.reduce_noise(
+                    y=audio_np,
+                    sr=sample_rate,
+                    prop_decrease=0.82,
+                    stationary=True
+                )
+            else:
+                reduced_np = audio_np
+
+            # 3. Auto-Gain Normalization (Perjelas suara pelan)
+            peak = np.max(np.abs(reduced_np))
+            if peak > 150:
+                target_peak = 24000.0
+                gain = min(6.0, target_peak / peak)
+                reduced_np = np.clip(reduced_np * gain, -32767, 32767)
+
+            return reduced_np.astype(np.int16).tobytes()
+
+        else:
+            # Fallback Auto-Gain menggunakan audioop bawaan Python
+            rms = audioop.rms(raw_pcm, 2)
+            if 100 < rms < 4000:
+                factor = min(4.5, 4500.0 / rms)
+                raw_pcm = audioop.mul(raw_pcm, 2, factor)
+            return raw_pcm
+    except Exception as e:
+        print(f"[Noise Suppression Warning] {e}")
+        return raw_pcm
 
 
 def stop_all_voice_playback():
@@ -92,12 +182,14 @@ def set_fullscreen_state(fullscreen: bool):
 class HoldToTalkRecorder:
     def __init__(self):
         self.recognizer = sr.Recognizer()
+        self.recognizer.dynamic_energy_threshold = True
+        self.recognizer.energy_threshold = 250
         self.is_recording = False
         self.frames = []
         self.lang = "en-US"
 
     def start_recording(self, payload="en-US"):
-        global target_lang, ui_submode, current_gender, current_female_mode, custom_personality
+        global target_lang, ui_submode, current_gender, current_female_mode, custom_personality, selected_mic_index
 
         # 1. Perintah Keluar Instan dari Tombol Hang-up Merah
         if payload == "CMD:EXIT":
@@ -126,7 +218,21 @@ class HoldToTalkRecorder:
             print("\n[TUZI UI] Beralih ke tab CHAT (Total Mute Aktif).")
             return
 
-        # 4. Perintah Swap Gender dari Settings (MALE / FEMALE)
+        # 4. Perintah Pilih Perangkat Mikrofon dari Menu Settings
+        if payload.startswith("MIC_DEV:"):
+            val = payload.split(":")[1].strip()
+            if val == "DEFAULT" or val == "":
+                selected_mic_index = None
+                print("\n[TUZI MIC] Menggunakan Mikrofon Default Sistem.")
+            else:
+                try:
+                    selected_mic_index = int(val)
+                    print(f"\n[TUZI MIC] Beralih ke Mikrofon Device Index #{selected_mic_index}")
+                except ValueError:
+                    selected_mic_index = None
+            return
+
+        # 5. Perintah Swap Gender dari Settings (MALE / FEMALE)
         if payload.startswith("GENDER:"):
             new_gender = payload.split(":")[1].lower()
             current_gender = new_gender
@@ -135,7 +241,7 @@ class HoldToTalkRecorder:
                 main_input_queue.put(f"[SYS_GENDER:{current_gender}]")
             return
 
-        # 5. Perintah Ganti Tipe Suara Female (1=Dandere, 2=Shy, 3=Mommy)
+        # 6. Perintah Ganti Tipe Suara Female (1=Dandere, 2=Shy, 3=Mommy)
         if payload.startswith("FMODE:"):
             try:
                 fmode = int(payload.split(":")[1])
@@ -147,7 +253,7 @@ class HoldToTalkRecorder:
                 pass
             return
 
-        # 6. Perintah Personal Intelligence (Custom Personality dari User)
+        # 7. Perintah Personal Intelligence (Custom Personality dari User)
         if payload.startswith("CUSTOM_PROMPT:"):
             custom_text = payload[len("CUSTOM_PROMPT:"):].strip()
             custom_personality = custom_text
@@ -159,7 +265,7 @@ class HoldToTalkRecorder:
                 main_input_queue.put(f"[SYS_CUSTOM_PROMPT:{custom_text}]")
             return
 
-        # 7. Pesan Teks dari Mode Chatbot (Total Mute)
+        # 8. Pesan Teks dari Mode Chatbot (Total Mute)
         if payload.startswith("CHAT:"):
             chat_text = payload[5:].strip()
             if chat_text and main_input_queue:
@@ -169,7 +275,7 @@ class HoldToTalkRecorder:
                 main_input_queue.put(f"[TEACH_INPUT] {chat_text}")
             return
 
-        # 8. Rekaman Suara Push-to-Talk pada Avatar Blob (Hanya di Mode Live)
+        # 9. Rekaman Suara Push-to-Talk pada Avatar Blob (Hanya di Mode Live)
         if ui_submode == "chat" or self.is_recording:
             return
         self.lang = payload
@@ -178,26 +284,81 @@ class HoldToTalkRecorder:
         self.frames = []
         threading.Thread(target=self._record_loop, daemon=True).start()
 
+    def _transcribe_audio(self, cleaned_pcm: bytes, sample_rate: int, sample_width: int) -> str:
+        """
+        Menerjemahkan rekaman suara menggunakan Whisper Large V3 Turbo (jika GROQ_API_KEY aktif)
+        atau Google STT dengan audio yang sudah dibersihkan oleh Noise Suppression.
+        """
+        # A. Prioritas 1: Whisper Large V3 Turbo (Sangat Akurat & Tahan Bising)
+        if groq_stt_client is not None:
+            try:
+                wav_buf = io.BytesIO()
+                with wave.open(wav_buf, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(sample_width)
+                    wf.setframerate(sample_rate)
+                    wf.writeframes(cleaned_pcm)
+                wav_buf.seek(0)
+
+                iso_lang = self.lang.split("-")[0].lower()  # "en", "ja", atau "id"
+                transcription = groq_stt_client.audio.transcriptions.create(
+                    file=("speech.wav", wav_buf.read()),
+                    model="whisper-large-v3-turbo",
+                    language=iso_lang,
+                    temperature=0.0,
+                )
+                if transcription and transcription.text:
+                    return transcription.text.strip()
+            except Exception as e:
+                print(f"[Whisper STT Fallback ke Google] {e}")
+
+        # B. Prioritas 2: Google STT dengan Audio yang Sudah Di-Denoise
+        audio_data = sr.AudioData(cleaned_pcm, sample_rate, sample_width)
+        return self.recognizer.recognize_google(audio_data, language=self.lang)
+
     def _record_loop(self):
         try:
-            with sr.Microphone(sample_rate=16000) as source:
-                print(f"\n[TEACH MIC - {self.lang}] Mendengarkan... (Tahan Avatar)")
-                while self.is_recording:
+            # Hentikan suara Tuzi jika sedang bicara saat user menekan avatar
+            stop_all_voice_playback()
+
+            mic_kwargs = {"sample_rate": 16000, "chunk_size": 1024}
+            if selected_mic_index is not None:
+                mic_kwargs["device_index"] = selected_mic_index
+
+            with sr.Microphone(**mic_kwargs) as source:
+                sample_rate = source.SAMPLE_RATE
+                sample_width = source.SAMPLE_WIDTH
+                print(f"\n[TEACH MIC - {self.lang}] Mendengarkan... (Silakan bicara)")
+
+                # Rekam selama tombol avatar ditahan (dan pastikan minimal 6 chunk terekam)
+                min_chunks = 6
+                while self.is_recording or len(self.frames) < min_chunks:
                     buffer = source.stream.read(source.CHUNK)
                     self.frames.append(buffer)
+                    if not self.is_recording and len(self.frames) >= min_chunks:
+                        break
 
-            if len(self.frames) > 3 and ui_submode == "live":
-                print("[TEACH MIC] Memproses ucapan Zak...")
-                raw_data = b"".join(self.frames)
-                audio_data = sr.AudioData(raw_data, 16000, 2)
-                text = self.recognizer.recognize_google(audio_data, language=self.lang)
-                if text and text.strip() and main_input_queue:
-                    print(f"[TEACH MIC] Zak: {text}")
-                    main_input_queue.put(f"[TEACH_INPUT] {text.strip()}")
+            raw_data = b"".join(self.frames)
+            if len(raw_data) < 2048 or ui_submode != "live":
+                return
+
+            rms_level = audioop.rms(raw_data, sample_width)
+            print(f"[TEACH MIC] Memproses suara Zak (Level Input Mic: {rms_level})...")
+            if rms_level < 25:
+                print("[TEACH MIC] Peringatan: Sinyal mikrofon sangat kecil/kosong. Cek pilihan Mic di menu Settings!")
+
+            # Terapkan Noise Suppression & Auto-Gain sebelum dikirim ke STT
+            cleaned_pcm = clean_voice_audio(raw_data, sample_rate=sample_rate)
+
+            text = self._transcribe_audio(cleaned_pcm, sample_rate, sample_width)
+            if text and text.strip() and main_input_queue:
+                print(f"[TEACH MIC] Zak: {text}")
+                main_input_queue.put(f"[TEACH_INPUT] {text.strip()}")
+
         except sr.UnknownValueError:
-            print("[TEACH MIC] Suara tidak terdengar jelas.")
+            print("[TEACH MIC] Suara tidak terdengar jelas. Coba bicara lebih dekat atau ganti Mic di Settings.")
         except Exception as e:
-            print(f"[TEACH MIC Error] {e}")
+            print(f"[TEACH MIC Error] Gagal mengakses mikrofon: {e}")
 
     def stop_recording(self):
         self.is_recording = False
@@ -269,11 +430,15 @@ def apply_window_state(window, active: bool):
 
 
 def get_ui_injection_js() -> str:
-    """Menyuntikkan UI dengan Dark Mode Hitam Pekat, Fullscreen/F11, & Gemini Settings List."""
+    """Menyuntikkan UI dengan Dark Mode Hitam Pekat, Fullscreen/F11, & Pemilih Mikrofon di Settings."""
     qwebchannel_code = get_qwebchannel_js()
+    mics_json = json.dumps(get_available_microphones())
+
     ui_code = """
     (function() {
         if (document.getElementById('tuzi-teach-overlay')) return;
+
+        const AVAILABLE_MICS = __MICS_JSON__;
 
         function connectPyBridge() {
             if (typeof QWebChannel !== 'undefined' && typeof qt !== 'undefined' && qt.webChannelTransport) {
@@ -298,12 +463,10 @@ def get_ui_injection_js() -> str:
                 box-sizing: border-box !important;
                 transition: background 0.25s ease, border-color 0.25s ease;
             }
-            /* Dark Mode Hitam Pekat Murni (Tanpa Unsur Biru) */
             body.teach-mode-active.dark-mode {
                 background: #000000 !important;
                 border-color: #222222 !important;
             }
-            /* Saat Full Screen 1920x1080 aktif, hilangkan lengkungan sudut bingkai */
             body.teach-mode-active.fullscreen-mode {
                 border-radius: 0px !important;
                 border: none !important;
@@ -372,7 +535,6 @@ def get_ui_injection_js() -> str:
             body.teach-mode-active.dark-mode #tuzi-window-size-btn {
                 background: #0D0D0D; color: #FFFFFF; border-color: #262626;
             }
-            /* Sembunyikan tombol UI saat masuk ke Mode Full Screen (keluar pakai F11) */
             body.teach-mode-active.fullscreen-mode #tuzi-window-size-btn {
                 display: none !important;
             }
@@ -657,6 +819,29 @@ def get_ui_injection_js() -> str:
             body.teach-mode-active:not(.dark-mode) .fmode-btn { border-color: #CCCCCC; }
             .fmode-btn.active { background: #F472B6; color: #FFFFFF; border-color: #F472B6; }
 
+            /* Pemilih Input Mikrofon di Settings */
+            .mic-select-box {
+                padding: 2px 6px 6px 6px;
+            }
+            #tuzi-mic-select {
+                width: 100%;
+                height: 36px;
+                border-radius: 10px;
+                padding: 0 10px;
+                font-size: 12.5px;
+                font-weight: 600;
+                background: #161616;
+                color: #F5F5F5;
+                border: 1px solid #2E2E2E;
+                outline: none;
+                cursor: pointer;
+            }
+            body.teach-mode-active:not(.dark-mode) #tuzi-mic-select {
+                background: #FFFFFF;
+                color: #171717;
+                border-color: #CCCCCC;
+            }
+
             /* 2. Item List di Dalam Settings Dropdown (Personal Intelligence & Theme) */
             .dropdown-list-item {
                 display: flex; align-items: center; justify-content: space-between;
@@ -865,7 +1050,6 @@ def get_ui_injection_js() -> str:
                 </svg>
             </button>
 
-            <!-- Tombol Full Screen (1920x1080) di Sebelah Kanan Atas (Hilang saat Full Screen, keluar via F11) -->
             <button id="tuzi-window-size-btn" title="Full Screen 1920x1080 (Tekan F11 untuk kembali ke ukuran Minimize)">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"></path>
@@ -952,7 +1136,7 @@ def get_ui_injection_js() -> str:
                         </div>
                     </button>
 
-                    <!-- Tombol Settings yang Membuka Menu List ke Bawah (Gaya Gemini) -->
+                    <!-- Tombol Settings yang Membuka Menu List ke Bawah -->
                     <button class="sidebar-item" id="menu-open-settings">
                         <div class="sidebar-item-left">
                             <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -981,6 +1165,14 @@ def get_ui_injection_js() -> str:
                                     <button class="fmode-btn" data-fmode="3">Mommy</button>
                                 </div>
                             </div>
+                        </div>
+
+                        <div class="dropdown-divider"></div>
+                        <div class="dropdown-section-title">Microphone Input (Noise Suppressed)</div>
+                        <div class="mic-select-box">
+                            <select id="tuzi-mic-select" title="Pilih perangkat mikrofon">
+                                <option value="DEFAULT">🎙️ Default System Microphone</option>
+                            </select>
                         </div>
 
                         <div class="dropdown-divider"></div>
@@ -1105,6 +1297,22 @@ def get_ui_injection_js() -> str:
         `;
         document.body.appendChild(overlay);
 
+        // Isi daftar mikrofon yang terdeteksi ke dalam dropdown Settings
+        let micSelect = document.getElementById('tuzi-mic-select');
+        if (AVAILABLE_MICS && AVAILABLE_MICS.length > 0) {
+            AVAILABLE_MICS.forEach(m => {
+                let opt = document.createElement('option');
+                opt.value = String(m.index);
+                opt.innerText = '🎙️ [' + m.index + '] ' + m.name;
+                micSelect.appendChild(opt);
+            });
+        }
+        micSelect.onchange = () => {
+            if (window.pyBridge) {
+                window.pyBridge.start_ptt('MIC_DEV:' + micSelect.value);
+            }
+        };
+
         let sidebar = document.getElementById('tuzi-sidebar');
         let burgerBtn = document.getElementById('tuzi-burger-btn');
         let closeSidebarBtn = document.getElementById('close-sidebar-btn');
@@ -1114,7 +1322,6 @@ def get_ui_injection_js() -> str:
         let dropdownThemeBtn = document.getElementById('btn-dropdown-theme');
         let winSizeBtn = document.getElementById('tuzi-window-size-btn');
 
-        // Toggle Light / Dark Mode
         function toggleTheme() {
             document.body.classList.toggle('dark-mode');
         }
@@ -1142,7 +1349,6 @@ def get_ui_injection_js() -> str:
             }
         });
 
-        // Buka / Tutup Sidebar & Dropdown List Settings ke Bawah
         burgerBtn.onclick = () => sidebar.classList.add('open');
         closeSidebarBtn.onclick = () => sidebar.classList.remove('open');
         openSettingsBtn.onclick = (e) => {
@@ -1151,7 +1357,6 @@ def get_ui_injection_js() -> str:
             openSettingsBtn.classList.toggle('expanded');
         };
 
-        // Swap Gender (Male Biru / Female Pink Muda)
         let btnMale = document.getElementById('btn-gender-male');
         let btnFemale = document.getElementById('btn-gender-female');
         let femaleOptions = document.getElementById('female-voice-options');
@@ -1181,7 +1386,6 @@ def get_ui_injection_js() -> str:
             };
         });
 
-        // --- LOGIKA KOLOM CHAT PERSONAL INTELLIGENCE ---
         let piModal = document.getElementById('tuzi-pi-modal');
         let openPiBtn = document.getElementById('btn-open-pi');
         let closePiBtn = document.getElementById('close-pi-btn');
@@ -1238,7 +1442,6 @@ def get_ui_injection_js() -> str:
             appendPiMessage('sys', 'Kepribadian dikembalikan ke mode bawaan (Default).');
         };
 
-        // --- LOGIKA ANIMASI AVATAR BLOB ---
         let blobStage = document.getElementById('ai-blob-stage');
         let blobWrapper = document.getElementById('ai-blob-wrapper');
         let blobBody = document.getElementById('ai-blob-body');
@@ -1446,5 +1649,6 @@ def get_ui_injection_js() -> str:
 
         window.setTeachModeUI(true);
     })();
-    """
+    """.replace("__MICS_JSON__", mics_json)
+
     return qwebchannel_code + "\n" + ui_code
