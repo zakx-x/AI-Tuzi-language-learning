@@ -157,7 +157,6 @@ class TransparentAvatarWindow(QMainWindow):
         event.accept()
         
     def keyPressEvent(self, event):
-        # Tekan F11 untuk keluar dari Full Screen (1920x1080) ke Minimize (1600x900) atau sebaliknya
         if event.key() == Qt.Key_F11:
             teach_language.set_fullscreen_state(not teach_language.is_fullscreen)
             event.accept()
