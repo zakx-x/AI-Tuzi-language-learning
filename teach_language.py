@@ -318,7 +318,6 @@ class HoldToTalkRecorder:
 
     def _record_loop(self):
         try:
-            # Hentikan suara Tuzi jika sedang bicara saat user menekan avatar
             stop_all_voice_playback()
 
             mic_kwargs = {"sample_rate": 16000, "chunk_size": 1024}
