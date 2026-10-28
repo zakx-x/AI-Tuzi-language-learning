@@ -38,3 +38,5 @@ tuzi_memory.json
 /tes_mouse.py
 /test_kamera.py
 /tuzi_mobile
+/claude_presence.py
+/claude_presence_config.json
