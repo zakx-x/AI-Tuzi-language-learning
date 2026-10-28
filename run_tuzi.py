@@ -34,6 +34,7 @@ from PyQt5.QtWidgets import QApplication, QMainWindow
 
 import config
 import teach_language
+from discord_presence import DiscordPresence
 
 try:
     import ai_tools
@@ -60,6 +61,30 @@ llm_client = OpenAI(
 ACTIVE_MODEL = "nousresearch/hermes-3-llama-3.1-70b"
 
 
+def _presence_context() -> dict:
+    """Konteks aman untuk Discord (tidak pernah berisi isi chat / prompt kustom)."""
+    if teach_language.custom_personality:
+        persona = "Custom"
+    elif teach_language.current_gender == "male":
+        persona = "Bro"
+    else:
+        persona = {1: "Dandere", 2: "Shy", 3: "Mommy"}.get(teach_language.current_female_mode, "Tuzi")
+    return {
+        "persona": persona,
+        "language": teach_language.target_lang,
+        "mode": teach_language.ui_submode,
+    }
+
+
+presence = DiscordPresence(
+    client_id=getattr(config, "DISCORD_CLIENT_ID", ""),
+    enabled=getattr(config, "ENABLE_DISCORD_PRESENCE", True),
+    context_provider=_presence_context,
+    large_image=getattr(config, "DISCORD_LARGE_IMAGE", "tuzi"),
+    small_icons=getattr(config, "DISCORD_SMALL_ICONS", False),
+)
+
+
 class QuietHTTPHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=BASE_DIR, **kwargs)
@@ -77,6 +102,7 @@ def start_local_server():
 class AvatarSignalBridge(QObject):
     mouth_signal = pyqtSignal(float)
     subtitle_signal = pyqtSignal(str)
+    subtitle_timed_signal = pyqtSignal(str, int)  # (text, audio_duration_ms)
     expression_signal = pyqtSignal(str)
     teach_mode_signal = pyqtSignal(bool)
 
@@ -129,6 +155,7 @@ class TransparentAvatarWindow(QMainWindow):
 
         self.bridge.mouth_signal.connect(self.update_mouth_in_web)
         self.bridge.subtitle_signal.connect(self.update_subtitle_in_web)
+        self.bridge.subtitle_timed_signal.connect(self.update_subtitle_timed_in_web)
         self.bridge.expression_signal.connect(self.update_expression_in_web)
         self.bridge.teach_mode_signal.connect(lambda active: teach_language.apply_window_state(self, active))
 
@@ -193,21 +220,98 @@ class TransparentAvatarWindow(QMainWindow):
                     word-wrap: break-word;
                 }
                 #tuzi-subtitle-box.show { opacity: 1; }
+
+                /* === TYPEWRITER: tiap huruf muncul satu-satu dengan efek pop + caret === */
+                #tuzi-subtitle-box .sub-char {
+                    display: inline-block;
+                    position: relative;
+                    opacity: 0;
+                    transform: translateY(5px) scale(0.92);
+                    transition: opacity 0.14s ease-out,
+                                transform 0.18s cubic-bezier(0.34, 1.56, 0.64, 1);
+                }
+                #tuzi-subtitle-box .sub-char.on {
+                    opacity: 1;
+                    transform: translateY(0) scale(1);
+                }
+                #tuzi-subtitle-box .sub-char.cur::after {
+                    content: '';
+                    position: absolute;
+                    right: -3px; top: 12%;
+                    width: 2px; height: 76%;
+                    background: currentColor;
+                    border-radius: 1px;
+                    animation: subCaret 0.8s steps(1) infinite;
+                }
+                @keyframes subCaret { 50% { opacity: 0; } }
             `;
             document.head.appendChild(style);
             let box = document.createElement('div');
             box.id = 'tuzi-subtitle-box';
             document.body.appendChild(box);
 
-            window.setSubtitle = function(htmlContent) {
+            let subTimer = null;
+            window.setSubtitle = function(text, durationMs) {
                 let elem = document.getElementById('tuzi-subtitle-box');
                 if (!elem) return;
-                if (!htmlContent || htmlContent.trim() === '') {
+                if (subTimer) { clearTimeout(subTimer); subTimer = null; }
+
+                if (!text || text.trim() === '') {
                     elem.classList.remove('show');
-                } else {
-                    elem.innerHTML = htmlContent;
-                    elem.classList.add('show');
+                    return;
                 }
+
+                // Pre-render semua huruf (opacity 0) supaya layout/wrap teks tidak loncat saat diketik
+                elem.textContent = '';
+                const chars = [];
+                const words = text.trim().split(' ').filter(Boolean);
+                words.forEach((word, wi) => {
+                    const w = document.createElement('span');
+                    w.style.whiteSpace = word.length <= 18 ? 'nowrap' : 'normal';
+                    for (const ch of word) {
+                        const c = document.createElement('span');
+                        c.className = 'sub-char';
+                        c.textContent = ch;
+                        w.appendChild(c);
+                        chars.push(c);
+                    }
+                    elem.appendChild(w);
+                    if (wi < words.length - 1) elem.appendChild(document.createTextNode(' '));
+                });
+                elem.classList.add('show');
+
+                // Jeda natural: koma sebentar, akhir kalimat lebih lama ("..." tidak dihitung 3x)
+                const isEnd = (ch) => !!ch && '.!?\u2026\u3002\uFF01\uFF1F'.includes(ch);
+                const isMid = (ch) => !!ch && ',;:\u3001\uFF0C'.includes(ch);
+                const weightAt = (i) => {
+                    const ch = chars[i].textContent;
+                    const next = chars[i + 1] ? chars[i + 1].textContent : '';
+                    if (isEnd(ch)) return isEnd(next) ? 1 : 5;
+                    if (isMid(ch)) return 3;
+                    return 1;
+                };
+                let totalWeight = 0;
+                for (let k = 0; k < chars.length; k++) totalWeight += weightAt(k);
+
+                // Sinkron dengan durasi audio (kalau ada), selesai sedikit sebelum suara berhenti
+                let unit = durationMs > 0 ? (durationMs * 0.85) / totalWeight : 34;
+                unit = Math.max(16, Math.min(unit, 70));
+
+                let i = 0, prev = null;
+                const step = () => {
+                    if (prev) prev.classList.remove('cur');
+                    if (i >= chars.length) { subTimer = null; return; }
+                    const idx = i++;
+                    const c = chars[idx];
+                    c.classList.add('on', 'cur');
+                    prev = c;
+                    if (i >= chars.length) {
+                        subTimer = setTimeout(() => { c.classList.remove('cur'); subTimer = null; }, 600);
+                        return;
+                    }
+                    subTimer = setTimeout(step, unit * weightAt(idx));
+                };
+                step();
             };
         })();
         """
@@ -221,6 +325,13 @@ class TransparentAvatarWindow(QMainWindow):
     def update_subtitle_in_web(self, html_content: str):
         escaped = json.dumps(html_content)
         self.webview.page().runJavaScript(f"if(window.setSubtitle) setSubtitle({escaped});")
+
+    @pyqtSlot(str, int)
+    def update_subtitle_timed_in_web(self, text: str, duration_ms: int):
+        escaped = json.dumps(text)
+        self.webview.page().runJavaScript(
+            f"if(window.setSubtitle) setSubtitle({escaped}, {int(duration_ms)});"
+        )
 
     @pyqtSlot(str)
     def update_expression_in_web(self, emo: str):
@@ -285,13 +396,26 @@ class ElevenLabsTTSEngine:
                 print(f"\n[ERROR Edge TTS] Gagal mengatur voice default: {e2}")
                 return None
 
-    async def speak_with_lipsync(self, text: str, emotion: str = "natural"):
+    async def speak_with_lipsync(self, text: str, emotion: str = "natural", subtitle: str = ""):
         tmp_path = await self.render_audio(text)
         if not tmp_path:
+            # Suara gagal dibuat -> tetap tampilkan subtitle (diketik dengan kecepatan default)
+            if subtitle:
+                self.bridge.subtitle_timed_signal.emit(subtitle, 0)
             return
+
+        # Ambil durasi audio supaya animasi ketik selaras dengan suara
+        duration_ms = 0
+        try:
+            duration_ms = int(pygame.mixer.Sound(tmp_path).get_length() * 1000)
+        except Exception:
+            pass
 
         pygame.mixer.music.load(tmp_path)
         pygame.mixer.music.play()
+        presence.set_state("speaking")
+        if subtitle:
+            self.bridge.subtitle_timed_signal.emit(subtitle, duration_ms)
 
         while pygame.mixer.music.get_busy():
             if teach_language.ui_submode == "chat":
@@ -513,6 +637,8 @@ def chat_processor_loop(bridge, tts_engine):
             if user_input.lower() in ["exit", "quit", "keluar"]:
                 os._exit(0)
 
+            presence.set_state("thinking")
+
             # 5. Pencarian Internet (Jika diperlukan)
             if ai_tools:
                 tool_context = ai_tools.get_tools_context(user_input)
@@ -541,14 +667,16 @@ def chat_processor_loop(bridge, tts_engine):
                 bridge.expression_signal.emit(emotion)
 
             if len(display_dialogue) > 1:
-                bridge.subtitle_signal.emit(display_dialogue)
-
                 if not is_chat_mute_mode:
+                    # Subtitle dikirim dari dalam speak_with_lipsync, tepat saat audio mulai diputar
                     with speech_lock:
                         loop.run_until_complete(
-                            tts_engine.speak_with_lipsync(spoken_dialogue, emotion=emotion)
+                            tts_engine.speak_with_lipsync(
+                                spoken_dialogue, emotion=emotion, subtitle=display_dialogue
+                            )
                         )
                 else:
+                    bridge.subtitle_timed_signal.emit(display_dialogue, 0)
                     print("[Sistem] Mode Chat Mute aktif — ElevenLabs & suara di-bypass.")
 
             if not is_chat_mute_mode:
@@ -556,8 +684,11 @@ def chat_processor_loop(bridge, tts_engine):
                 bridge.subtitle_signal.emit("")
                 bridge.expression_signal.emit("natural")
 
+            presence.set_state("idle")
+
         except Exception as e:
             print(f"\n[ERROR Tuzi AI] Gagal memproses pesan: {e}")
+            presence.set_state("idle")
             time.sleep(2)
 
 
@@ -574,6 +705,9 @@ if __name__ == "__main__":
     window.show()
 
     tts = ElevenLabsTTSEngine(bridge)
+
+    teach_language.presence_callback = presence.set_state
+    presence.start()
 
     keyboard_thread = threading.Thread(target=keyboard_input_loop, daemon=True)
     keyboard_thread.start()

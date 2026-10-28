@@ -44,6 +44,17 @@ selected_mic_index = getattr(config, "MIC_DEVICE_INDEX", None)
 main_input_queue = None
 main_window_ref = None
 
+# Diisi oleh run_tuzi.py -> dipakai untuk Discord Rich Presence
+presence_callback = None
+
+
+def _set_presence(state: str):
+    if presence_callback:
+        try:
+            presence_callback(state)
+        except Exception:
+            pass
+
 # Ukuran Mode Kecil / Minimize (1600x900) & Mode Full Screen (1920x1080)
 TEACH_WIN_WIDTH = 1600
 TEACH_WIN_HEIGHT = 900
@@ -282,6 +293,7 @@ class HoldToTalkRecorder:
         target_lang = payload
         self.is_recording = True
         self.frames = []
+        _set_presence("listening")
         threading.Thread(target=self._record_loop, daemon=True).start()
 
     def _transcribe_audio(self, cleaned_pcm: bytes, sample_rate: int, sample_width: int) -> str:
@@ -317,6 +329,7 @@ class HoldToTalkRecorder:
         return self.recognizer.recognize_google(audio_data, language=self.lang)
 
     def _record_loop(self):
+        queued = False
         try:
             stop_all_voice_playback()
 
@@ -353,11 +366,16 @@ class HoldToTalkRecorder:
             if text and text.strip() and main_input_queue:
                 print(f"[TEACH MIC] Zak: {text}")
                 main_input_queue.put(f"[TEACH_INPUT] {text.strip()}")
+                queued = True
+                _set_presence("thinking")
 
         except sr.UnknownValueError:
             print("[TEACH MIC] Suara tidak terdengar jelas. Coba bicara lebih dekat atau ganti Mic di Settings.")
         except Exception as e:
             print(f"[TEACH MIC Error] Gagal mengakses mikrofon: {e}")
+        finally:
+            if not queued:
+                _set_presence("idle")
 
     def stop_recording(self):
         self.is_recording = False
@@ -1595,14 +1613,14 @@ def get_ui_injection_js() -> str:
         });
 
         const origSetSubtitle = window.setSubtitle;
-        window.setSubtitle = function(htmlContent) {
+        window.setSubtitle = function(htmlContent, durationMs) {
             const isChatTab = document.body.classList.contains('chat-tab-open');
             if (isChatTab) {
                 if (htmlContent && htmlContent.trim() !== '') {
                     window.appendTeachChatBubble('bot', htmlContent);
                 }
             } else {
-                if (origSetSubtitle) origSetSubtitle(htmlContent);
+                if (origSetSubtitle) origSetSubtitle(htmlContent, durationMs);
                 if (htmlContent && htmlContent.trim() !== '') {
                     window.appendTeachChatBubble('bot', htmlContent);
                 }
