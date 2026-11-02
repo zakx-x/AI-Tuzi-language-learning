@@ -399,12 +399,10 @@ class ElevenLabsTTSEngine:
     async def speak_with_lipsync(self, text: str, emotion: str = "natural", subtitle: str = ""):
         tmp_path = await self.render_audio(text)
         if not tmp_path:
-            # Suara gagal dibuat -> tetap tampilkan subtitle (diketik dengan kecepatan default)
             if subtitle:
                 self.bridge.subtitle_timed_signal.emit(subtitle, 0)
             return
 
-        # Ambil durasi audio supaya animasi ketik selaras dengan suara
         duration_ms = 0
         try:
             duration_ms = int(pygame.mixer.Sound(tmp_path).get_length() * 1000)
