@@ -93,8 +93,6 @@ def clean_voice_audio(raw_pcm: bytes, sample_rate: int = 16000) -> bytes:
     try:
         if HAS_NOISEREDUCE:
             audio_np = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32)
-
-            # 1. Hilangkan DC Offset
             audio_np = audio_np - np.mean(audio_np)
 
             # 2. Jalankan Spectral Gating Noise Suppression (noisereduce)
