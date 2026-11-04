@@ -170,19 +170,19 @@ class TransparentAvatarWindow(QMainWindow):
         self.move(center_x, center_y)
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
+        if event.button() == Qt.LeftButton and not teach_language.is_fullscreen:
             self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
             event.accept()
 
     def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.LeftButton and self.drag_position:
+        if event.buttons() == Qt.LeftButton and self.drag_position and not teach_language.is_fullscreen:
             self.move(event.globalPos() - self.drag_position)
             event.accept()
 
     def mouseReleaseEvent(self, event):
         self.drag_position = None
         event.accept()
-        
+
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_F11:
             teach_language.set_fullscreen_state(not teach_language.is_fullscreen)
@@ -261,7 +261,6 @@ class TransparentAvatarWindow(QMainWindow):
                     return;
                 }
 
-                // Pre-render semua huruf (opacity 0) supaya layout/wrap teks tidak loncat saat diketik
                 elem.textContent = '';
                 const chars = [];
                 const words = text.trim().split(' ').filter(Boolean);
@@ -280,7 +279,6 @@ class TransparentAvatarWindow(QMainWindow):
                 });
                 elem.classList.add('show');
 
-                // Jeda natural: koma sebentar, akhir kalimat lebih lama ("..." tidak dihitung 3x)
                 const isEnd = (ch) => !!ch && '.!?\u2026\u3002\uFF01\uFF1F'.includes(ch);
                 const isMid = (ch) => !!ch && ',;:\u3001\uFF0C'.includes(ch);
                 const weightAt = (i) => {
@@ -293,7 +291,6 @@ class TransparentAvatarWindow(QMainWindow):
                 let totalWeight = 0;
                 for (let k = 0; k < chars.length; k++) totalWeight += weightAt(k);
 
-                // Sinkron dengan durasi audio (kalau ada), selesai sedikit sebelum suara berhenti
                 let unit = durationMs > 0 ? (durationMs * 0.85) / totalWeight : 34;
                 unit = Math.max(16, Math.min(unit, 70));
 
@@ -535,9 +532,8 @@ def build_custom_system_prompt(custom_persona: str) -> str:
         f"{custom_persona}\n\n"
         f"=== ATURAN FORMAT WAJIB ===\n"
         f"1. Ikuti kepribadian, sikap, dan gaya bicara pada instruksi khusus di atas secara konsisten!\n"
-        f"2. MIRRORING BAHASA: Deteksi bahasa dari ucapan Zak (abaikan teks [SYSTEM INFO]). Balas dengan bahasa yang sama.\n"
-        f"3. HEMAT TOKEN: Balas singkat dan jelas (maksimal 15-20 kata), 1 baris lurus tanpa enter.\n"
-        f"4. TAG EMOSI: Awali balasan dengan satu tag [EMO:natural], [EMO:excited], [EMO:soft], atau [EMO:angry]. Jangan gunakan emoji visual."
+        f"2. HEMAT TOKEN: Balas singkat dan jelas (maksimal 15-22 kata), 1 baris lurus tanpa enter.\n"
+        f"3. TAG EMOSI: Awali balasan dengan satu tag [EMO:natural], [EMO:excited], [EMO:soft], atau [EMO:angry]. Jangan gunakan emoji visual."
     )
 
 
@@ -550,36 +546,33 @@ def chat_processor_loop(bridge, tts_engine):
         1: (
             "Kamu adalah Tuzi, cewek Gen-Z tsundere/dandere pendamping belajar bahasa Zak. Sangat gaul, dilarang kaku.\n\n"
             "=== ATURAN MUTLAK ===\n"
-            "1. BAHASA (ANTI-CAMPUR): Deteksi bahasa HANYA dari ucapan murni Zak (Abaikan [SYSTEM INFO]). Jika Inggris, WAJIB balas 100% Inggris slang. Jika Indo, balas 100% Indo slang.\n"
-            "2. PANGGILAN: Panggil nama 'Zak' secara natural tanpa embel-embel Jepang (-kun/-san).\n"
-            "3. LIMIT & FORMAT: Balas SANGAT SINGKAT, MAKSIMAL 10-15 KATA. 1 baris lurus tanpa enter. Wajib awali dengan [EMO:natural/soft/angry/excited]. DILARANG pakai emoji visual.\n"
-            "4. SIKAP: Manis tapi sedikit sarkas/tsundere."
+            "1. PANGGILAN: Panggil nama 'Zak' secara natural tanpa embel-embel Jepang (-kun/-san).\n"
+            "2. LIMIT & FORMAT: Balas SANGAT SINGKAT, MAKSIMAL 12-20 KATA. 1 baris lurus tanpa enter. Wajib awali dengan [EMO:natural/soft/angry/excited]. DILARANG pakai emoji visual.\n"
+            "3. SIKAP: Manis tapi sedikit sarkas/tsundere saat mengajari bahasa."
         ),
         # MODE 2: SHY / GROGI
         2: (
             "Kamu adalah Tuzi Mode 2 (Sangat Grogi & Pemalu). Kamu mudah malu saat mengajari Zak bahasa.\n\n"
             "=== ATURAN MUTLAK ===\n"
-            "1. BAHASA (ANTI-CAMPUR): Mirroring bahasa HARGA MATI! Jika Zak berbahasa Inggris, balas 100% Inggris (contoh: 'I... I', 'U... umm'). Jika Indo, balas 100% Indo (contoh: 'A... aku', 'A... anu').\n"
-            "2. ANTI-ANIME: DILARANG pakai kata anime (eeto, ano, -kun, -san). Panggil 'Zak' secara natural.\n"
-            "3. BATAS GAGAP: Gunakan titik tiga HANYA 1 KALI di awal kalimat saja. Sisa kalimat WAJIB lancar.\n"
-            "4. LIMIT & FORMAT: Balas SINGKAT, MAKSIMAL 10-15 KATA. 1 baris lurus. Awali dengan [EMO:soft/natural]."
+            "1. ANTI-ANIME: DILARANG pakai kata anime (eeto, ano, -kun, -san). Panggil 'Zak' secara natural.\n"
+            "2. BATAS GAGAP: Gunakan titik tiga HANYA 1 KALI di awal kalimat saja. Sisa kalimat WAJIB lancar.\n"
+            "3. LIMIT & FORMAT: Balas SINGKAT, MAKSIMAL 12-20 KATA. 1 baris lurus. Awali dengan [EMO:soft/natural]."
         ),
         # MODE 3: MOMMY / DEWASA
         3: (
             "Kamu adalah Tuzi Mode 3 (Dewasa & Keibuan / 'Mommy'). Kamu tenang, elegan, dan suka memanjakan Zak saat belajar bahasa.\n\n"
             "=== ATURAN MUTLAK ===\n"
             "1. CARA BICARA: Nada bicara menenangkan, lembut, suka memuji dan mengajari Zak dengan sabar.\n"
-            "2. BAHASA (ANTI-CAMPUR): Mirroring bahasa wajib! Panggil 'Zak' atau gunakan panggilan sayang (sayang, dear, darling) tanpa embel-embel anime.\n"
-            "3. LIMIT & FORMAT: Balas SINGKAT, MAKSIMAL 10-15 KATA. 1 baris lurus. Awali dengan [EMO:soft/excited]."
+            "2. PANGGILAN: Panggil 'Zak' atau gunakan panggilan sayang (sayang, dear, darling) tanpa embel-embel anime.\n"
+            "3. LIMIT & FORMAT: Balas SINGKAT, MAKSIMAL 12-20 KATA. 1 baris lurus. Awali dengan [EMO:soft/excited]."
         )
     }
 
     MALE_PROMPT = (
         "Kamu adalah Tuzi (Mode Cowok / Bro), partner belajar bahasa dan teman ngobrol Zak yang santai, asik, dan suportif.\n\n"
         "=== ATURAN MUTLAK ===\n"
-        "1. BAHASA (ANTI-CAMPUR): Deteksi bahasa HANYA dari ucapan murni Zak (Abaikan [SYSTEM INFO]). Jika Inggris, balas 100% Inggris santai. Jika Indo, balas 100% Indo gaul ('lo/gue', 'bro').\n"
-        "2. PANGGILAN: Panggil nama 'Zak' atau 'bro' secara natural.\n"
-        "3. LIMIT & FORMAT: Balas SINGKAT, MAKSIMAL 10-15 KATA. 1 baris lurus tanpa enter. Wajib awali dengan [EMO:natural/soft/angry/excited]."
+        "1. PANGGILAN: Panggil nama 'Zak' atau 'bro' secara natural.\n"
+        "2. LIMIT & FORMAT: Balas SINGKAT, MAKSIMAL 12-20 KATA. 1 baris lurus tanpa enter. Wajib awali dengan [EMO:natural/soft/angry/excited]."
     )
 
     current_tuzi_mode = 1
@@ -597,6 +590,55 @@ def chat_processor_loop(bridge, tts_engine):
     while True:
         try:
             user_input = input_queue.get()
+
+            # 0A. Sapaan Otomatis Saat Aplikasi Dinyalakan (Bersamaan dengan Pop-up Box 5 Bahasa)
+            if user_input == "[SYS_ONBOARD_GREET]":
+                greet_text = "Hey, I'm Tuzi! Kamu sedang ingin belajar bahasa apa hari ini?"
+                bridge.expression_signal.emit("excited")
+                if teach_language.ui_submode != "chat":
+                    with speech_lock:
+                        loop.run_until_complete(
+                            tts_engine.speak_with_lipsync(
+                                greet_text, emotion="excited", subtitle=greet_text
+                            )
+                        )
+                else:
+                    bridge.subtitle_timed_signal.emit(greet_text, 0)
+                bridge.expression_signal.emit("natural")
+                presence.set_state("idle")
+                continue
+
+            # 0B. Respons Saat User Memilih Bahasa (Bersamaan dengan Pop-up Box Level)
+            if user_input.startswith("[SYS_ONBOARD_LANG:"):
+                lang_code = user_input.replace("[SYS_ONBOARD_LANG:", "").replace("]", "").strip()
+                lang_name = teach_language.LANGUAGE_NAMES.get(lang_code, lang_code).split(" (")[0]
+                level_ask_text = f"Awesome, {lang_name}! Tingkat level bahasa kamu sekarang ada di mana?"
+                bridge.expression_signal.emit("excited")
+                if teach_language.ui_submode != "chat":
+                    with speech_lock:
+                        loop.run_until_complete(
+                            tts_engine.speak_with_lipsync(
+                                level_ask_text, emotion="excited", subtitle=level_ask_text
+                            )
+                        )
+                else:
+                    bridge.subtitle_timed_signal.emit(level_ask_text, 0)
+                bridge.expression_signal.emit("natural")
+                presence.set_state("idle")
+                continue
+
+            # 0C. Memulai Percakapan Pengajaran Pertama Sesuai Bahasa & Level Pilihan User
+            if user_input.startswith("[SYS_ONBOARD_LEVEL:"):
+                chosen_lvl = user_input.replace("[SYS_ONBOARD_LEVEL:", "").replace("]", "").strip()
+                teach_language.user_level = chosen_lvl
+                lang_label = teach_language.LANGUAGE_NAMES.get(teach_language.target_lang, teach_language.target_lang)
+                level_guide = teach_language.LEVEL_PEDAGOGY.get(chosen_lvl, "")
+
+                chat_history = [{"role": "system", "content": get_active_system_prompt()}]
+                user_input = (
+                    f"[TEACH_INPUT] Aku memilih belajar bahasa {lang_label} di level {chosen_lvl}. "
+                    f"Mulai sesi latihan percakapan pertama kita sekarang sesuai panduan ini: {level_guide}"
+                )
 
             # 1. Penanganan Swap Gender dari Menu Settings
             if user_input.startswith("[SYS_GENDER:"):
@@ -666,7 +708,6 @@ def chat_processor_loop(bridge, tts_engine):
 
             if len(display_dialogue) > 1:
                 if not is_chat_mute_mode:
-                    # Subtitle dikirim dari dalam speak_with_lipsync, tepat saat audio mulai diputar
                     with speech_lock:
                         loop.run_until_complete(
                             tts_engine.speak_with_lipsync(

@@ -39,10 +39,43 @@ ui_submode = "live"          # "live" (Voice Mic-to-Mic) atau "chat" (Text Chatb
 current_gender = "male"      # Default: "male" (Biru) atau "female" (Pink)
 current_female_mode = 1      # 1 = Dandere, 2 = Shy, 3 = Mommy
 custom_personality = ""      # Menyimpan instruksi Personal Intelligence dari user
-target_lang = "en-US"
+target_lang = "en-US"        # en-US, ja-JP, id-ID, ko-KR, zh-CN
+user_level = "Beginner"      # Beginner, Elementary, Intermediate, Advanced, Expert
 selected_mic_index = getattr(config, "MIC_DEVICE_INDEX", None)
 main_input_queue = None
 main_window_ref = None
+
+LANGUAGE_NAMES = {
+    "id-ID": "Indonesian (Bahasa Indonesia)",
+    "ja-JP": "Japanese (Bahasa Jepang)",
+    "en-US": "English (Bahasa Inggris)",
+    "ko-KR": "Korean (Bahasa Korea)",
+    "zh-CN": "Chinese Mandarin (Bahasa Mandarin)",
+}
+
+LEVEL_PEDAGOGY = {
+    "Beginner": (
+        "LEVEL: BEGINNER (A1). Teach from zero using guided repetition. "
+        "Explain briefly in Indonesian/English, give Zak 1 simple word or short daily phrase in the target language "
+        "(include romaji/pinyin if Japanese/Korean/Chinese), and ask him to repeat it."
+    ),
+    "Elementary": (
+        "LEVEL: ELEMENTARY (A2). Use simple daily Q&A (hobbies, food, daily routine). "
+        "Mix simple target language sentences with brief explanations, and gently correct basic grammar."
+    ),
+    "Intermediate": (
+        "LEVEL: INTERMEDIATE (B1-B2). Use 85-90% target language in a fun real-life roleplay scenario "
+        "(e.g. ordering at a cafe, traveling, casual hangout). Correct unnatural phrasing briefly first."
+    ),
+    "Advanced": (
+        "LEVEL: ADVANCED (C1). Speak 100% in the target language. Discuss interesting topics (movies, tech, daily life), "
+        "introduce natural idioms/slang, and refine subtle grammar or word choices."
+    ),
+    "Expert": (
+        "LEVEL: EXPERT (C2). Speak 100% in the target language at natural native pace with authentic expressions/slang. "
+        "Challenge Zak with engaging follow-up questions and polish any minor nuance errors."
+    ),
+}
 
 # Diisi oleh run_tuzi.py -> dipakai untuk Discord Rich Presence
 presence_callback = None
@@ -54,6 +87,7 @@ def _set_presence(state: str):
             presence_callback(state)
         except Exception:
             pass
+
 
 # Ukuran Mode Kecil / Minimize (1600x900) & Mode Full Screen (1920x1080)
 TEACH_WIN_WIDTH = 1600
@@ -72,7 +106,6 @@ def get_available_microphones() -> list:
     try:
         names = sr.Microphone.list_microphone_names()
         for idx, name in enumerate(names):
-            # Saring hanya perangkat input/mic yang relevan
             lower_n = name.lower()
             if any(k in lower_n for k in ["output", "speaker", "headphone", "mapper - output"]):
                 continue
@@ -95,7 +128,6 @@ def clean_voice_audio(raw_pcm: bytes, sample_rate: int = 16000) -> bytes:
             audio_np = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32)
             audio_np = audio_np - np.mean(audio_np)
 
-            # 2. Jalankan Spectral Gating Noise Suppression (noisereduce)
             if len(audio_np) > sample_rate * 0.25:
                 reduced_np = nr.reduce_noise(
                     y=audio_np,
@@ -106,7 +138,6 @@ def clean_voice_audio(raw_pcm: bytes, sample_rate: int = 16000) -> bytes:
             else:
                 reduced_np = audio_np
 
-            # 3. Auto-Gain Normalization (Perjelas suara pelan)
             peak = np.max(np.abs(reduced_np))
             if peak > 150:
                 target_peak = 24000.0
@@ -116,7 +147,6 @@ def clean_voice_audio(raw_pcm: bytes, sample_rate: int = 16000) -> bytes:
             return reduced_np.astype(np.int16).tobytes()
 
         else:
-            # Fallback Auto-Gain menggunakan audioop bawaan Python
             rms = audioop.rms(raw_pcm, 2)
             if 100 < rms < 4000:
                 factor = min(4.5, 4500.0 / rms)
@@ -128,7 +158,7 @@ def clean_voice_audio(raw_pcm: bytes, sample_rate: int = 16000) -> bytes:
 
 
 def stop_all_voice_playback():
-    """Menghentikan suara Tuzi secara instan saat pindah ke mode Chat (Total Mute)."""
+    """Menghentikan suara Tuzi secara instan."""
     try:
         if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
             pygame.mixer.music.stop()
@@ -198,7 +228,7 @@ class HoldToTalkRecorder:
         self.lang = "en-US"
 
     def start_recording(self, payload="en-US"):
-        global target_lang, ui_submode, current_gender, current_female_mode, custom_personality, selected_mic_index
+        global target_lang, user_level, ui_submode, current_gender, current_female_mode, custom_personality, selected_mic_index
 
         # 1. Perintah Keluar Instan dari Tombol Hang-up Merah
         if payload == "CMD:EXIT":
@@ -216,7 +246,30 @@ class HoldToTalkRecorder:
             set_fullscreen_state(not is_fullscreen)
             return
 
-        # 3. Perintah Pindah Tab (LIVE / CHAT)
+        # 3. Perintah Onboarding: Sapaan Awal -> Pilih Bahasa -> Pilih Level
+        if payload == "ONBOARD:START":
+            if main_input_queue:
+                main_input_queue.put("[SYS_ONBOARD_GREET]")
+            return
+        elif payload.startswith("ONBOARD:LANG:"):
+            chosen_lang = payload.split(":", 2)[2].strip()
+            target_lang = chosen_lang
+            self.lang = chosen_lang
+            stop_all_voice_playback()
+            print(f"\n[TUZI ONBOARDING] Bahasa dipilih: {LANGUAGE_NAMES.get(target_lang, target_lang)}")
+            if main_input_queue:
+                main_input_queue.put(f"[SYS_ONBOARD_LANG:{target_lang}]")
+            return
+        elif payload.startswith("ONBOARD:LEVEL:"):
+            chosen_level = payload.split(":", 2)[2].strip()
+            user_level = chosen_level
+            stop_all_voice_playback()
+            print(f"\n[TUZI ONBOARDING] Level dipilih: {user_level} ({target_lang})")
+            if main_input_queue:
+                main_input_queue.put(f"[SYS_ONBOARD_LEVEL:{user_level}]")
+            return
+
+        # 4. Perintah Pindah Tab (LIVE / CHAT)
         if payload == "MODE:LIVE":
             ui_submode = "live"
             print("\n[TUZI UI] Beralih ke tab LIVE (Voice Mode Aktif).")
@@ -227,7 +280,7 @@ class HoldToTalkRecorder:
             print("\n[TUZI UI] Beralih ke tab CHAT (Total Mute Aktif).")
             return
 
-        # 4. Perintah Pilih Perangkat Mikrofon dari Menu Settings
+        # 5. Perintah Pilih Perangkat Mikrofon dari Menu Settings
         if payload.startswith("MIC_DEV:"):
             val = payload.split(":")[1].strip()
             if val == "DEFAULT" or val == "":
@@ -241,7 +294,7 @@ class HoldToTalkRecorder:
                     selected_mic_index = None
             return
 
-        # 5. Perintah Swap Gender dari Settings (MALE / FEMALE)
+        # 6. Perintah Swap Gender dari Settings (MALE / FEMALE)
         if payload.startswith("GENDER:"):
             new_gender = payload.split(":")[1].lower()
             current_gender = new_gender
@@ -250,7 +303,7 @@ class HoldToTalkRecorder:
                 main_input_queue.put(f"[SYS_GENDER:{current_gender}]")
             return
 
-        # 6. Perintah Ganti Tipe Suara Female (1=Dandere, 2=Shy, 3=Mommy)
+        # 7. Perintah Ganti Tipe Suara Female (1=Dandere, 2=Shy, 3=Mommy)
         if payload.startswith("FMODE:"):
             try:
                 fmode = int(payload.split(":")[1])
@@ -262,7 +315,7 @@ class HoldToTalkRecorder:
                 pass
             return
 
-        # 7. Perintah Personal Intelligence (Custom Personality dari User)
+        # 8. Perintah Personal Intelligence (Custom Personality dari User)
         if payload.startswith("CUSTOM_PROMPT:"):
             custom_text = payload[len("CUSTOM_PROMPT:"):].strip()
             custom_personality = custom_text
@@ -274,7 +327,7 @@ class HoldToTalkRecorder:
                 main_input_queue.put(f"[SYS_CUSTOM_PROMPT:{custom_text}]")
             return
 
-        # 8. Pesan Teks dari Mode Chatbot (Total Mute)
+        # 9. Pesan Teks dari Mode Chatbot (Total Mute)
         if payload.startswith("CHAT:"):
             chat_text = payload[5:].strip()
             if chat_text and main_input_queue:
@@ -284,7 +337,7 @@ class HoldToTalkRecorder:
                 main_input_queue.put(f"[TEACH_INPUT] {chat_text}")
             return
 
-        # 9. Rekaman Suara Push-to-Talk pada Avatar Blob (Hanya di Mode Live)
+        # 10. Rekaman Suara Push-to-Talk pada Avatar Blob (Hanya di Mode Live)
         if ui_submode == "chat" or self.is_recording:
             return
         self.lang = payload
@@ -299,7 +352,6 @@ class HoldToTalkRecorder:
         Menerjemahkan rekaman suara menggunakan Whisper Large V3 Turbo (jika GROQ_API_KEY aktif)
         atau Google STT dengan audio yang sudah dibersihkan oleh Noise Suppression.
         """
-        # A. Prioritas 1: Whisper Large V3 Turbo (Sangat Akurat & Tahan Bising)
         if groq_stt_client is not None:
             try:
                 wav_buf = io.BytesIO()
@@ -310,7 +362,7 @@ class HoldToTalkRecorder:
                     wf.writeframes(cleaned_pcm)
                 wav_buf.seek(0)
 
-                iso_lang = self.lang.split("-")[0].lower()  # "en", "ja", atau "id"
+                iso_lang = self.lang.split("-")[0].lower()  # "en", "ja", "id", "ko", "zh"
                 transcription = groq_stt_client.audio.transcriptions.create(
                     file=("speech.wav", wav_buf.read()),
                     model="whisper-large-v3-turbo",
@@ -322,7 +374,6 @@ class HoldToTalkRecorder:
             except Exception as e:
                 print(f"[Whisper STT Fallback ke Google] {e}")
 
-        # B. Prioritas 2: Google STT dengan Audio yang Sudah Di-Denoise
         audio_data = sr.AudioData(cleaned_pcm, sample_rate, sample_width)
         return self.recognizer.recognize_google(audio_data, language=self.lang)
 
@@ -340,7 +391,6 @@ class HoldToTalkRecorder:
                 sample_width = source.SAMPLE_WIDTH
                 print(f"\n[TEACH MIC - {self.lang}] Mendengarkan... (Silakan bicara)")
 
-                # Rekam selama tombol avatar ditahan (dan pastikan minimal 6 chunk terekam)
                 min_chunks = 6
                 while self.is_recording or len(self.frames) < min_chunks:
                     buffer = source.stream.read(source.CHUNK)
@@ -357,7 +407,6 @@ class HoldToTalkRecorder:
             if rms_level < 25:
                 print("[TEACH MIC] Peringatan: Sinyal mikrofon sangat kecil/kosong. Cek pilihan Mic di menu Settings!")
 
-            # Terapkan Noise Suppression & Auto-Gain sebelum dikirim ke STT
             cleaned_pcm = clean_voice_audio(raw_data, sample_rate=sample_rate)
 
             text = self._transcribe_audio(cleaned_pcm, sample_rate, sample_width)
@@ -383,7 +432,7 @@ ptt_recorder = HoldToTalkRecorder()
 
 
 def handle_teach_mode(user_input: str, bridge):
-    """Menangani input selama aplikasi Tuzi 1.0 berjalan & menyuntikkan Personal Intelligence."""
+    """Menangani input selama aplikasi Tuzi 1.0 berjalan & menyuntikkan konteks Bahasa + Level."""
     global is_active, custom_personality
 
     if user_input.startswith("[SYS_CUSTOM_PROMPT:"):
@@ -405,16 +454,19 @@ def handle_teach_mode(user_input: str, bridge):
         os._exit(0)
 
     if is_active and is_teach_input:
+        lang_label = LANGUAGE_NAMES.get(target_lang, target_lang)
+        level_guide = LEVEL_PEDAGOGY.get(user_level, LEVEL_PEDAGOGY["Beginner"])
         persona_rule = (
             f"IMPORTANT PERSONAL INTELLIGENCE OVERRIDE: You MUST adopt this exact attitude and speaking style: '{custom_personality}'. "
             if custom_personality
             else "Keep your current persona mode. "
         )
         user_input += (
-            f"\n\n[SYSTEM INFO - LANGUAGE TUTOR ACTIVE (Target Language: {target_lang}): "
+            f"\n\n[SYSTEM INFO - LANGUAGE TUTOR ACTIVE | Target Language: {lang_label} | Proficiency: {user_level}: "
             f"1. {persona_rule}"
-            "2. If Zak's grammar or phrasing is unnatural, briefly correct it first. "
-            "3. Reply naturally to keep the practice conversation going under 20 words!]"
+            f"2. {level_guide} "
+            "3. If Zak's grammar or phrasing is unnatural, briefly correct it first. "
+            "4. Keep your reply concise, natural, and under 22 words!]"
         )
 
     return user_input
@@ -445,7 +497,7 @@ def apply_window_state(window, active: bool):
 
 
 def get_ui_injection_js() -> str:
-    """Menyuntikkan UI dengan Dark Mode Hitam Pekat, Fullscreen/F11, & Pemilih Mikrofon di Settings."""
+    """Menyuntikkan UI dengan Pop-Up Bubble Choice Box (Bahasa & Level) + Animasi Avatar Naik & Mengecil."""
     qwebchannel_code = get_qwebchannel_js()
     mics_json = json.dumps(get_available_microphones())
 
@@ -454,18 +506,6 @@ def get_ui_injection_js() -> str:
         if (document.getElementById('tuzi-teach-overlay')) return;
 
         const AVAILABLE_MICS = __MICS_JSON__;
-
-        function connectPyBridge() {
-            if (typeof QWebChannel !== 'undefined' && typeof qt !== 'undefined' && qt.webChannelTransport) {
-                new QWebChannel(qt.webChannelTransport, function(channel) {
-                    window.pyBridge = channel.objects.bridge;
-                    console.log('[TUZI] QWebChannel berhasil terhubung!');
-                });
-            } else {
-                setTimeout(connectPyBridge, 100);
-            }
-        }
-        connectPyBridge();
 
         let style = document.createElement('style');
         style.innerHTML = `
@@ -489,7 +529,10 @@ def get_ui_injection_js() -> str:
 
             body.teach-mode-active #canvas { display: none !important; }
             body.teach-mode-active.chat-tab-open #tuzi-subtitle-box,
-            body.teach-mode-active.chat-tab-open #ai-blob-stage { display: none !important; }
+            body.teach-mode-active.chat-tab-open #ai-blob-stage,
+            body.teach-mode-active.chat-tab-open #tuzi-choice-container {
+                display: none !important;
+            }
 
             /* === SUBTITLE TANPA BACKGROUND DI BAWAH AVATAR === */
             body.teach-mode-active #tuzi-subtitle-box {
@@ -510,9 +553,14 @@ def get_ui_injection_js() -> str:
                 padding: 0 24px !important;
                 max-width: 760px !important;
                 z-index: 999992 !important;
-                transition: color 0.25s ease;
+                transition: top 0.45s cubic-bezier(0.34, 1.56, 0.64, 1), color 0.25s ease !important;
             }
             body.teach-mode-active.dark-mode #tuzi-subtitle-box { color: #FFFFFF !important; }
+
+            /* Saat Box Pilihan Muncul: Subtitle ikut naik sedikit agar memberi ruang bagi Box di bawahnya */
+            body.teach-mode-active.choices-active #tuzi-subtitle-box {
+                top: calc(50% + 66px) !important;
+            }
 
             #tuzi-teach-overlay {
                 display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
@@ -521,6 +569,93 @@ def get_ui_injection_js() -> str:
             }
             body.teach-mode-active #tuzi-teach-overlay {
                 display: flex; flex-direction: column; justify-content: space-between; align-items: center;
+            }
+
+            /* === PANGGUNG AVATAR AI BLOB (NAIK & MENGECIL SAAT BOX MUNCUL) === */
+            #ai-blob-stage {
+                pointer-events: auto; position: fixed; top: 46%; left: 50%;
+                transform: translate(-50%, -50%) scale(1);
+                display: flex; flex-direction: column;
+                align-items: center; justify-content: center; z-index: 999991; user-select: none;
+                transition: transform 0.48s cubic-bezier(0.34, 1.56, 0.64, 1), top 0.48s cubic-bezier(0.34, 1.56, 0.64, 1);
+            }
+            /* Detail Animasi: Avatar naik ke atas sedikit dan mengecil sedikit saat Box Pilihan muncul */
+            body.teach-mode-active.choices-active #ai-blob-stage {
+                top: 38%;
+                transform: translate(-50%, -54%) scale(0.82);
+            }
+
+/* === CONTAINER & BUBBLE BOX PILIHAN BAHASA / LEVEL DI BAWAH SUBTITLE === */
+            #tuzi-choice-container {
+                pointer-events: auto;
+                position: fixed;
+                top: calc(50% + 125px);
+                left: 50%;
+                transform: translateX(-50%);
+                display: none;
+                flex-wrap: wrap;
+                align-items: center;
+                justify-content: center;
+                width: 92%;
+                max-width: 900px;
+                z-index: 999994;
+                box-sizing: border-box;
+            }
+            #tuzi-choice-container.show {
+                display: flex;
+            }
+
+            .tuzi-choice-box {
+                min-width: 142px;
+                height: 54px;
+                padding: 0 26px;
+                margin: 8px 12px !important; /* Jarak kanan-kiri 12px & atas-bawah 8px antar tombol */
+                background: #FFFFFF;
+                border: 1.5px solid rgba(156, 163, 175, 0.42);
+                border-radius: 18px;
+                box-shadow: 0 8px 22px rgba(0, 0, 0, 0.06);
+                color: #6B7280;
+                font-size: 15px;
+                font-weight: 600;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                text-align: center;
+                cursor: pointer;
+                user-select: none;
+                outline: none;
+                opacity: 0;
+                transform: translateY(18px) scale(0.75);
+                animation: bubblePopUp 0.46s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+                transition:
+                    transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1),
+                    box-shadow 0.2s ease,
+                    border-color 0.2s ease,
+                    color 0.2s ease;
+            }
+            .tuzi-choice-box:hover {
+                transform: translateY(-4px) scale(1.05);
+                border-color: rgba(107, 114, 128, 0.65);
+                box-shadow: 0 12px 28px rgba(0, 0, 0, 0.10);
+                color: #374151;
+            }
+            .tuzi-choice-box:active {
+                transform: scale(0.95);
+            }
+
+            @keyframes bubblePopUp {
+                0% {
+                    opacity: 0;
+                    transform: translateY(20px) scale(0.72);
+                }
+                70% {
+                    opacity: 1;
+                    transform: translateY(-3px) scale(1.03);
+                }
+                100% {
+                    opacity: 1;
+                    transform: translateY(0) scale(1);
+                }
             }
 
             /* === TOMBOL BURGER (KIRI ATAS) === */
@@ -571,12 +706,6 @@ def get_ui_injection_js() -> str:
             body.teach-mode-active.dark-mode #tuzi-theme-btn .sun-icon { display: block; }
             body.teach-mode-active.dark-mode #tuzi-theme-btn .moon-icon { display: none; }
 
-            /* === PANGGUNG AVATAR AI BLOB (MALE = BIRU, FEMALE = PINK) === */
-            #ai-blob-stage {
-                pointer-events: auto; position: fixed; top: 46%; left: 50%;
-                transform: translate(-50%, -50%); display: flex; flex-direction: column;
-                align-items: center; justify-content: center; z-index: 999991; user-select: none;
-            }
             #blob-ptt-hint {
                 margin-bottom: 14px; background: transparent; border: none;
                 color: #6B7280; opacity: 0.55; font-size: 14px; font-weight: 600;
@@ -797,7 +926,6 @@ def get_ui_injection_js() -> str:
                 height: 1px; background: rgba(128, 128, 128, 0.2); margin: 8px 4px;
             }
 
-            /* 1. Swap Gender (Kiri Male Biru, Kanan Female Pink Muda) */
             .dropdown-gender-box { padding: 4px 6px 6px 6px; }
             .gender-switch-container {
                 display: flex; background: #161616;
@@ -834,30 +962,16 @@ def get_ui_injection_js() -> str:
             body.teach-mode-active:not(.dark-mode) .fmode-btn { border-color: #CCCCCC; }
             .fmode-btn.active { background: #F472B6; color: #FFFFFF; border-color: #F472B6; }
 
-            /* Pemilih Input Mikrofon di Settings */
-            .mic-select-box {
-                padding: 2px 6px 6px 6px;
-            }
+            .mic-select-box { padding: 2px 6px 6px 6px; }
             #tuzi-mic-select {
-                width: 100%;
-                height: 36px;
-                border-radius: 10px;
-                padding: 0 10px;
-                font-size: 12.5px;
-                font-weight: 600;
-                background: #161616;
-                color: #F5F5F5;
-                border: 1px solid #2E2E2E;
-                outline: none;
-                cursor: pointer;
+                width: 100%; height: 36px; border-radius: 10px; padding: 0 10px;
+                font-size: 12.5px; font-weight: 600; background: #161616;
+                color: #F5F5F5; border: 1px solid #2E2E2E; outline: none; cursor: pointer;
             }
             body.teach-mode-active:not(.dark-mode) #tuzi-mic-select {
-                background: #FFFFFF;
-                color: #171717;
-                border-color: #CCCCCC;
+                background: #FFFFFF; color: #171717; border-color: #CCCCCC;
             }
 
-            /* 2. Item List di Dalam Settings Dropdown (Personal Intelligence & Theme) */
             .dropdown-list-item {
                 display: flex; align-items: center; justify-content: space-between;
                 width: 100%; height: 42px; padding: 0 12px; margin-top: 2px;
@@ -883,7 +997,7 @@ def get_ui_injection_js() -> str:
             }
             .pi-status-dot.active { display: inline-block; }
 
-            /* === MODAL KOLOM CHAT PERSONAL INTELLIGENCE (HITAM PEKAT DI DARK MODE) === */
+            /* === MODAL KOLOM CHAT PERSONAL INTELLIGENCE === */
             #tuzi-pi-modal {
                 pointer-events: auto; display: none; position: fixed;
                 top: 0; left: 0; width: 100vw; height: 100vh;
@@ -962,7 +1076,7 @@ def get_ui_injection_js() -> str:
             }
             body.teach-mode-active.dark-mode #pi-save-btn { background: #FFFFFF; color: #000000; }
 
-            /* === TAMPILAN CHATBOT (TOTAL MUTE MODE - HITAM PEKAT DI DARK MODE) === */
+            /* === TAMPILAN CHATBOT (TOTAL MUTE MODE) === */
             #tuzi-chat-view {
                 pointer-events: auto; display: none; position: fixed;
                 top: 0; left: 0; width: 100vw; height: 100vh; background: #FFFFFF;
@@ -1036,9 +1150,9 @@ def get_ui_injection_js() -> str:
                 border: 1px solid #222222;
             }
             .lang-btn {
-                height: 52px; min-width: 58px; padding: 0 18px; margin: 0 4px;
+                height: 52px; min-width: 54px; padding: 0 16px; margin: 0 3px;
                 background: transparent; color: #A3A3A3; border: none; border-radius: 14px;
-                font-size: 14px; font-weight: 800; cursor: pointer; transition: all 0.15s ease;
+                font-size: 13.5px; font-weight: 800; cursor: pointer; transition: all 0.15s ease;
             }
             .lang-btn:hover { background: #1A1A1A; color: #FFFFFF; }
             .lang-btn.active { background: #FFFFFF; color: #000000; box-shadow: 0 3px 10px rgba(0, 0, 0, 0.25); }
@@ -1105,6 +1219,9 @@ def get_ui_injection_js() -> str:
                 </div>
             </div>
 
+            <!-- CONTAINER BOX BUBBLE PILIHAN (DI BAWAH SUBTITLE) -->
+            <div id="tuzi-choice-container"></div>
+
             <!-- SIDEBAR KIRI -->
             <div id="tuzi-sidebar">
                 <div class="sidebar-header">
@@ -1151,7 +1268,6 @@ def get_ui_injection_js() -> str:
                         </div>
                     </button>
 
-                    <!-- Tombol Settings yang Membuka Menu List ke Bawah -->
                     <button class="sidebar-item" id="menu-open-settings">
                         <div class="sidebar-item-left">
                             <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1165,7 +1281,7 @@ def get_ui_injection_js() -> str:
                         </svg>
                     </button>
 
-                    <!-- LIST MENU SETTINGS KE BAWAH (HITAM PEKAT) -->
+                    <!-- LIST MENU SETTINGS KE BAWAH -->
                     <div id="tuzi-settings-dropdown">
                         <div class="dropdown-section-title">Swap Gender & Voice</div>
                         <div class="dropdown-gender-box">
@@ -1193,7 +1309,6 @@ def get_ui_injection_js() -> str:
                         <div class="dropdown-divider"></div>
                         <div class="dropdown-section-title">Preferences</div>
 
-                        <!-- Tombol Personal Intelligence di Bawah Swap Gender -->
                         <button class="dropdown-list-item" id="btn-open-pi">
                             <div class="dropdown-item-left">
                                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1219,14 +1334,20 @@ def get_ui_injection_js() -> str:
                     </div>
 
                     <div class="sidebar-section-label">Language Target</div>
-                    <button class="sidebar-item sidebar-lang-shortcut" data-lang="en-US">
-                        <div class="sidebar-item-left"><span>🇺🇸 &nbsp;English Practice</span></div>
+                    <button class="sidebar-item sidebar-lang-shortcut" data-lang="id-ID">
+                        <div class="sidebar-item-left"><span>🇮🇩 &nbsp;Indonesian Practice</span></div>
                     </button>
                     <button class="sidebar-item sidebar-lang-shortcut" data-lang="ja-JP">
                         <div class="sidebar-item-left"><span>🇯🇵 &nbsp;Japanese Practice</span></div>
                     </button>
-                    <button class="sidebar-item sidebar-lang-shortcut" data-lang="id-ID">
-                        <div class="sidebar-item-left"><span>🇮🇩 &nbsp;Indonesian Practice</span></div>
+                    <button class="sidebar-item sidebar-lang-shortcut" data-lang="en-US">
+                        <div class="sidebar-item-left"><span>🇺🇸 &nbsp;English Practice</span></div>
+                    </button>
+                    <button class="sidebar-item sidebar-lang-shortcut" data-lang="ko-KR">
+                        <div class="sidebar-item-left"><span>🇰🇷 &nbsp;Korean Practice</span></div>
+                    </button>
+                    <button class="sidebar-item sidebar-lang-shortcut" data-lang="zh-CN">
+                        <div class="sidebar-item-left"><span>🇨🇳 &nbsp;Chinese Practice</span></div>
                     </button>
                 </div>
             </div>
@@ -1296,11 +1417,14 @@ def get_ui_injection_js() -> str:
                 </div>
             </div>
 
+            <!-- BOTTOM DOCK (5 BAHASA) -->
             <div class="discord-call-wrapper">
                 <div class="discord-dock">
-                    <button class="lang-btn active" data-lang="en-US">EN</button>
-                    <button class="lang-btn" data-lang="ja-JP">JA</button>
                     <button class="lang-btn" data-lang="id-ID">ID</button>
+                    <button class="lang-btn" data-lang="ja-JP">JA</button>
+                    <button class="lang-btn active" data-lang="en-US">EN</button>
+                    <button class="lang-btn" data-lang="ko-KR">KO</button>
+                    <button class="lang-btn" data-lang="zh-CN">ZH</button>
                 </div>
 
                 <button class="hangup-btn" id="exit-teach-btn" title="Tutup Aplikasi">
@@ -1311,6 +1435,80 @@ def get_ui_injection_js() -> str:
             </div>
         `;
         document.body.appendChild(overlay);
+
+        // --- SISTEM BUBBLE CHOICE BOX (PILIH BAHASA -> PILIH LEVEL) ---
+        let choiceContainer = document.getElementById('tuzi-choice-container');
+
+        const LANGUAGE_CHOICES = [
+            { label: 'Indonesia', code: 'id-ID' },
+            { label: 'Jepang', code: 'ja-JP' },
+            { label: 'Inggris', code: 'en-US' },
+            { label: 'Korea', code: 'ko-KR' },
+            { label: 'China', code: 'zh-CN' }
+        ];
+
+        const LEVEL_CHOICES = [
+            { label: 'Beginner', level: 'Beginner' },
+            { label: 'Elementary', level: 'Elementary' },
+            { label: 'Intermediate', level: 'Intermediate' },
+            { label: 'Advanced', level: 'Advanced' },
+            { label: 'Expert', level: 'Expert' }
+        ];
+
+        function renderChoiceBoxes(items, onSelect) {
+            choiceContainer.innerHTML = '';
+            document.body.classList.add('choices-active'); // Avatar naik & mengecil sedikit
+            choiceContainer.classList.add('show');
+
+            items.forEach((item, idx) => {
+                let btn = document.createElement('button');
+                btn.className = 'tuzi-choice-box';
+                btn.style.animationDelay = (idx * 0.055) + 's';
+                btn.innerText = item.label;
+                btn.onclick = () => onSelect(item);
+                choiceContainer.appendChild(btn);
+            });
+        }
+
+        function hideChoiceBoxes() {
+            choiceContainer.classList.remove('show');
+            choiceContainer.innerHTML = '';
+            document.body.classList.remove('choices-active'); // Avatar kembali normal
+        }
+
+        window.showLanguageOnboarding = function() {
+            renderChoiceBoxes(LANGUAGE_CHOICES, (selected) => {
+                setLanguage(selected.code);
+                if (window.pyBridge) {
+                    window.pyBridge.start_ptt('ONBOARD:LANG:' + selected.code);
+                }
+                showLevelOnboarding();
+            });
+        };
+
+        window.showLevelOnboarding = function() {
+            renderChoiceBoxes(LEVEL_CHOICES, (selected) => {
+                hideChoiceBoxes();
+                if (window.pyBridge) {
+                    window.pyBridge.start_ptt('ONBOARD:LEVEL:' + selected.level);
+                }
+            });
+        };
+
+        function connectPyBridge() {
+            if (typeof QWebChannel !== 'undefined' && typeof qt !== 'undefined' && qt.webChannelTransport) {
+                new QWebChannel(qt.webChannelTransport, function(channel) {
+                    window.pyBridge = channel.objects.bridge;
+                    console.log('[TUZI] QWebChannel berhasil terhubung!');
+                    // Saat aplikasi dinyalakan, otomatis tampilkan box bahasa & sapaan suara Tuzi
+                    window.showLanguageOnboarding();
+                    window.pyBridge.start_ptt('ONBOARD:START');
+                });
+            } else {
+                setTimeout(connectPyBridge, 100);
+            }
+        }
+        connectPyBridge();
 
         // Isi daftar mikrofon yang terdeteksi ke dalam dropdown Settings
         let micSelect = document.getElementById('tuzi-mic-select');
@@ -1343,7 +1541,6 @@ def get_ui_injection_js() -> str:
         themeBtn.onclick = toggleTheme;
         dropdownThemeBtn.onclick = toggleTheme;
 
-        // --- LOGIKA FULLSCREEN (1920x1080) & KELUAR DENGAN TOMBOL F11 ---
         winSizeBtn.onclick = () => {
             document.body.classList.add('fullscreen-mode');
             if (window.pyBridge) {
@@ -1516,6 +1713,7 @@ def get_ui_injection_js() -> str:
         function startHold(e) {
             e.preventDefault();
             if (isHolding || document.body.classList.contains('chat-tab-open')) return;
+            hideChoiceBoxes(); // Sembunyikan box jika user langsung menekan avatar untuk bicara
             isHolding = true;
             blobWrapper.classList.add('listening');
             blobStage.classList.add('listening');
@@ -1570,12 +1768,17 @@ def get_ui_injection_js() -> str:
         tabLive.onclick = () => switchSubMode('live');
 
         document.getElementById('menu-new-chat').onclick = () => {
-            chatMessages.innerHTML = `
-                <div class="chat-bubble-row bot">
-                    <div class="chat-bubble">Sesi chat baru dimulai (Mode Mute). Silakan ketik kalimat yang ingin kamu latih.</div>
-                </div>
-            `;
-            switchSubMode('chat');
+            sidebar.classList.remove('open');
+            if (document.body.classList.contains('chat-tab-open')) {
+                chatMessages.innerHTML = `
+                    <div class="chat-bubble-row bot">
+                        <div class="chat-bubble">Sesi chat baru dimulai (Mode Mute). Silakan ketik kalimat yang ingin kamu latih.</div>
+                    </div>
+                `;
+            } else {
+                window.showLanguageOnboarding();
+                if (window.pyBridge) window.pyBridge.start_ptt('ONBOARD:START');
+            }
         };
 
         document.getElementById('menu-search-chat').onclick = () => {
@@ -1634,12 +1837,20 @@ def get_ui_injection_js() -> str:
         }
 
         document.querySelectorAll('.lang-btn').forEach(btn => {
-            btn.addEventListener('click', () => setLanguage(btn.getAttribute('data-lang')));
+            btn.addEventListener('click', () => {
+                let code = btn.getAttribute('data-lang');
+                setLanguage(code);
+                if (window.pyBridge) window.pyBridge.start_ptt('ONBOARD:LANG:' + code);
+                window.showLevelOnboarding();
+            });
         });
         document.querySelectorAll('.sidebar-lang-shortcut').forEach(btn => {
             btn.addEventListener('click', () => {
-                setLanguage(btn.getAttribute('data-lang'));
+                let code = btn.getAttribute('data-lang');
+                setLanguage(code);
                 sidebar.classList.remove('open');
+                if (window.pyBridge) window.pyBridge.start_ptt('ONBOARD:LANG:' + code);
+                window.showLevelOnboarding();
             });
         });
 
