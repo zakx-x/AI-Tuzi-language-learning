@@ -36,7 +36,7 @@ except ImportError:
 is_active = True
 is_fullscreen = False        # False = Mode Kecil/Minimize (1600x900), True = Full Screen (1920x1080)
 ui_submode = "live"          # "live" (Voice Mic-to-Mic) atau "chat" (Text Chatbot - Total Mute)
-current_gender = "male"      # Default: "male" (Biru) atau "female" (Pink)
+current_gender = "female"    # [DIUBAH]: Default awal sekarang adalah "female" (Main Voice Female)
 current_female_mode = 1      # 1 = Dandere, 2 = Shy, 3 = Mommy
 custom_personality = ""      # Menyimpan instruksi Personal Intelligence dari user
 target_lang = "en-US"        # en-US, ja-JP, id-ID, ko-KR, zh-CN
@@ -497,7 +497,7 @@ def apply_window_state(window, active: bool):
 
 
 def get_ui_injection_js() -> str:
-    """Menyuntikkan UI dengan Pop-Up Bubble Choice Box 2 Baris (Dengan Bendera) & Anti-Null Guard."""
+    """Menyuntikkan UI dengan Main Voice Default Female (Pink) & Pop-Up Bubble Choice Box 2 Baris."""
     qwebchannel_code = get_qwebchannel_js()
     mics_json = json.dumps(get_available_microphones())
 
@@ -509,7 +509,6 @@ def get_ui_injection_js() -> str:
                 return;
             }
 
-            // Hapus overlay lama jika sempat tersisa agar tidak konflik
             let oldOverlay = document.getElementById('tuzi-teach-overlay');
             if (oldOverlay) oldOverlay.remove();
 
@@ -541,7 +540,6 @@ def get_ui_injection_js() -> str:
                     border: none !important;
                 }
 
-                /* Pastikan kanvas VTuber selalu disembunyikan saat Teach Mode aktif */
                 body.teach-mode-active #canvas,
                 body.teach-mode-active canvas {
                     display: none !important;
@@ -552,7 +550,7 @@ def get_ui_injection_js() -> str:
                     display: none !important;
                 }
 
-                /* === SUBTITLE TANPA BACKGROUND DI BAWAH AVATAR (DINAIKKAN KE ATAS) === */
+                /* === SUBTITLE TANPA BACKGROUND DI BAWAH AVATAR === */
                 body.teach-mode-active #tuzi-subtitle-box {
                     position: fixed !important;
                     top: calc(50% + 88px) !important;
@@ -575,7 +573,6 @@ def get_ui_injection_js() -> str:
                 }
                 body.teach-mode-active.dark-mode #tuzi-subtitle-box { color: #FFFFFF !important; }
 
-                /* Saat Box Pilihan Muncul: Subtitle naik ke tengah tepat di bawah Avatar */
                 body.teach-mode-active.choices-active #tuzi-subtitle-box {
                     top: calc(50% - 18px) !important;
                 }
@@ -589,7 +586,7 @@ def get_ui_injection_js() -> str:
                     display: flex; flex-direction: column; justify-content: space-between; align-items: center;
                 }
 
-                /* === PANGGUNG AVATAR AI BLOB (DINAIKKAN KE ATAS & MENGECIL SAAT BOX MUNCUL) === */
+                /* === PANGGUNG AVATAR AI BLOB === */
                 #ai-blob-stage {
                     pointer-events: auto; position: fixed; top: 39%; left: 50%;
                     transform: translate(-50%, -50%) scale(1);
@@ -1296,15 +1293,15 @@ def get_ui_injection_js() -> str:
                             </svg>
                         </button>
 
-                        <!-- LIST MENU SETTINGS KE BAWAH -->
+                        <!-- LIST MENU SETTINGS KE BAWAH (DEFAULT: FEMALE AKTIF) -->
                         <div id="tuzi-settings-dropdown">
                             <div class="dropdown-section-title">Swap Gender & Voice</div>
                             <div class="dropdown-gender-box">
                                 <div class="gender-switch-container">
-                                    <button class="gender-switch-btn male-btn active" id="btn-gender-male">♂ Male</button>
-                                    <button class="gender-switch-btn female-btn" id="btn-gender-female">♀ Female</button>
+                                    <button class="gender-switch-btn male-btn" id="btn-gender-male">♂ Male</button>
+                                    <button class="gender-switch-btn female-btn active" id="btn-gender-female">♀ Female</button>
                                 </div>
-                                <div id="female-voice-options">
+                                <div id="female-voice-options" class="show">
                                     <div class="fmode-row">
                                         <button class="fmode-btn active" data-fmode="1">Dandere</button>
                                         <button class="fmode-btn" data-fmode="2">Shy</button>
@@ -1443,8 +1440,8 @@ def get_ui_injection_js() -> str:
             `;
             document.body.appendChild(overlay);
 
-            // 1. LANGSUNG AKTIFKAN MODE BLOB SEKARANG JUGA (SEMBUNYIKAN VTUBER #canvas)
-            document.body.classList.add('teach-mode-active');
+            // 1. LANGSUNG AKTIFKAN MODE BLOB & SET FEMALE SEBAGAI DEFAULT SAAT APP DIBUKA
+            document.body.classList.add('teach-mode-active', 'female-avatar');
 
             // 2. DEKLARASIKAN SEMUA ELEMEN DOM TERLEBIH DAHULU DENGAN PENGAMAN ANTI-NULL
             let sidebar = document.getElementById('tuzi-sidebar');
