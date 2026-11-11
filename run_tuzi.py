@@ -343,22 +343,39 @@ class ElevenLabsTTSEngine:
         self.model_id = getattr(self.voice_cfg, "MODEL_ID", "eleven_v4_turbo")
         self.client = ElevenLabs(api_key=self.api_key)
 
-        self.current_gender = "male"
+        # [DIUBAH]: Default Main Voice saat aplikasi dibuka sekarang adalah FEMALE (Mode 1: Dandere)
+        self.current_gender = "female"
         self.current_mode = 1
         self.voice_id = ""
-        self.set_voice("male", 1)
+        self.set_voice("female", 1)
         pygame.mixer.init()
 
     def set_voice(self, gender: str = "female", mode: int = 1):
         self.current_gender = gender.lower()
         self.current_mode = mode
+        candidate_id = ""
+
         if self.voice_cfg:
-            self.voice_id = self.voice_cfg.get_voice_id(self.current_gender, self.current_mode)
+            candidate_id = self.voice_cfg.get_voice_id(self.current_gender, self.current_mode)
         else:
             if self.current_gender == "male":
-                self.voice_id = getattr(config, "ELEVENLABS_VOICE_MALE", "")
+                candidate_id = getattr(config, "ELEVENLABS_VOICE_MALE", "")
             else:
-                self.voice_id = getattr(config, f"ELEVENLABS_VOICE_{mode}", "")
+                candidate_id = getattr(config, f"ELEVENLABS_VOICE_{mode}", "")
+
+        # Pengaman jika Voice ID di config.py belum diisi atau masih placeholder
+        if not candidate_id or "MASUKKAN_" in candidate_id.upper() or "PASTE_" in candidate_id.upper():
+            if self.current_gender == "male":
+                candidate_id = "pNInz6obpgDQGcFmaJgB"
+            else:
+                fallback_female = getattr(config, f"ELEVENLABS_VOICE_{mode}", getattr(config, "ELEVENLABS_VOICE_1", ""))
+                candidate_id = (
+                    fallback_female
+                    if (fallback_female and "MASUKKAN_" not in fallback_female.upper())
+                    else "21m00Tcm4TlvDq8ikWAM"
+                )
+
+        self.voice_id = candidate_id
 
     def set_voice_mode(self, mode: int):
         self.set_voice(self.current_gender, mode)
@@ -575,10 +592,11 @@ def chat_processor_loop(bridge, tts_engine):
         "2. LIMIT & FORMAT: Balas SINGKAT, MAKSIMAL 12-20 KATA. 1 baris lurus tanpa enter. Wajib awali dengan [EMO:natural/soft/angry/excited]."
     )
 
+    # [DIUBAH]: Default saat aplikasi dibuka adalah Female Mode 1 (Dandere)
     current_tuzi_mode = 1
-    current_gender = "male"
+    current_gender = "female"
     custom_intelligence_prompt = ""
-    chat_history = load_memory(MALE_PROMPT)
+    chat_history = load_memory(TUZI_PROMPTS[current_tuzi_mode])
 
     def get_active_system_prompt():
         if custom_intelligence_prompt:
