@@ -105,6 +105,8 @@ class AvatarSignalBridge(QObject):
     subtitle_timed_signal = pyqtSignal(str, int)  # (text, audio_duration_ms)
     expression_signal = pyqtSignal(str)
     teach_mode_signal = pyqtSignal(bool)
+    quiz_options_signal = pyqtSignal(str)         # Merender kotak pilihan ganda Duolingo
+    quiz_state_signal = pyqtSignal(str)           # Mengubah warna kata (abu-abu / biru / kuning)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -158,6 +160,8 @@ class TransparentAvatarWindow(QMainWindow):
         self.bridge.subtitle_timed_signal.connect(self.update_subtitle_timed_in_web)
         self.bridge.expression_signal.connect(self.update_expression_in_web)
         self.bridge.teach_mode_signal.connect(lambda active: teach_language.apply_window_state(self, active))
+        self.bridge.quiz_options_signal.connect(self.update_quiz_options_in_web)
+        self.bridge.quiz_state_signal.connect(self.update_quiz_state_in_web)
 
         self.webview.loadFinished.connect(self.inject_subtitle_system)
         timestamp = int(time.time())
@@ -221,7 +225,6 @@ class TransparentAvatarWindow(QMainWindow):
                 }
                 #tuzi-subtitle-box.show { opacity: 1; }
 
-                /* === TYPEWRITER: tiap huruf muncul satu-satu dengan efek pop + caret === */
                 #tuzi-subtitle-box .sub-char {
                     display: inline-block;
                     position: relative;
@@ -334,6 +337,16 @@ class TransparentAvatarWindow(QMainWindow):
     def update_expression_in_web(self, emo: str):
         self.webview.page().runJavaScript(f"if(window.setExpression) setExpression('{emo}');")
 
+    @pyqtSlot(str)
+    def update_quiz_options_in_web(self, quiz_json: str):
+        escaped = json.dumps(quiz_json)
+        self.webview.page().runJavaScript(f"if(window.renderGrammarQuiz) renderGrammarQuiz({escaped});")
+
+    @pyqtSlot(str)
+    def update_quiz_state_in_web(self, state_json: str):
+        escaped = json.dumps(state_json)
+        self.webview.page().runJavaScript(f"if(window.updateGrammarQuizState) updateGrammarQuizState({escaped});")
+
 
 class ElevenLabsTTSEngine:
     def __init__(self, bridge):
@@ -343,7 +356,6 @@ class ElevenLabsTTSEngine:
         self.model_id = getattr(self.voice_cfg, "MODEL_ID", "eleven_v4_turbo")
         self.client = ElevenLabs(api_key=self.api_key)
 
-        # [DIUBAH]: Default Main Voice saat aplikasi dibuka sekarang adalah FEMALE (Mode 1: Dandere)
         self.current_gender = "female"
         self.current_mode = 1
         self.voice_id = ""
@@ -363,7 +375,6 @@ class ElevenLabsTTSEngine:
             else:
                 candidate_id = getattr(config, f"ELEVENLABS_VOICE_{mode}", "")
 
-        # Pengaman jika Voice ID di config.py belum diisi atau masih placeholder
         if not candidate_id or "MASUKKAN_" in candidate_id.upper() or "PASTE_" in candidate_id.upper():
             if self.current_gender == "male":
                 candidate_id = "pNInz6obpgDQGcFmaJgB"
@@ -449,7 +460,9 @@ def extract_emotion_and_text(raw_text: str) -> tuple[str, str, str]:
     emo_match = re.search(r"\[EMO:\s*(\w+)\]", raw_text, flags=re.IGNORECASE)
     emotion = emo_match.group(1).lower() if emo_match else "natural"
 
-    display_text = re.sub(r"\[.*?\]", "", raw_text)
+    # Hapus blok [QUIZ_DATA: {...}] dan tag sistem lainnya agar tidak ikut dibaca suara TTS
+    cleaned = re.sub(r"\[QUIZ_DATA:\s*\{.*?\}\s*\]", "", raw_text, flags=re.IGNORECASE | re.DOTALL)
+    display_text = re.sub(r"\[.*?\]", "", cleaned)
 
     emoji_pattern = re.compile(
         r"["
@@ -592,7 +605,6 @@ def chat_processor_loop(bridge, tts_engine):
         "2. LIMIT & FORMAT: Balas SINGKAT, MAKSIMAL 12-20 KATA. 1 baris lurus tanpa enter. Wajib awali dengan [EMO:natural/soft/angry/excited]."
     )
 
-    # [DIUBAH]: Default saat aplikasi dibuka adalah Female Mode 1 (Dandere)
     current_tuzi_mode = 1
     current_gender = "female"
     custom_intelligence_prompt = ""
@@ -645,7 +657,21 @@ def chat_processor_loop(bridge, tts_engine):
                 presence.set_state("idle")
                 continue
 
-            # 0C. Memulai Percakapan Pengajaran Pertama Sesuai Bahasa & Level Pilihan User
+            # 0C. Saat User Mengklik Logo Volume (🔊) di Kiri Kotak Pilihan Ganda -> Tuzi Membacakan Kalimatnya
+            if user_input.startswith("[SYS_READ_OPTION:"):
+                parts = user_input[len("[SYS_READ_OPTION:"):-1].split(":", 1)
+                opt_text = parts[1].strip() if len(parts) > 1 else ""
+                if opt_text and teach_language.ui_submode != "chat":
+                    bridge.expression_signal.emit("soft")
+                    with speech_lock:
+                        loop.run_until_complete(
+                            tts_engine.speak_with_lipsync(opt_text, emotion="soft", subtitle="")
+                        )
+                    bridge.expression_signal.emit("natural")
+                presence.set_state("idle")
+                continue
+
+            # 0D. Memulai Kuis Pertama Sesuai Bahasa & Level Pilihan User
             if user_input.startswith("[SYS_ONBOARD_LEVEL:"):
                 chosen_lvl = user_input.replace("[SYS_ONBOARD_LEVEL:", "").replace("]", "").strip()
                 teach_language.user_level = chosen_lvl
@@ -655,8 +681,40 @@ def chat_processor_loop(bridge, tts_engine):
                 chat_history = [{"role": "system", "content": get_active_system_prompt()}]
                 user_input = (
                     f"[TEACH_INPUT] Aku memilih belajar bahasa {lang_label} di level {chosen_lvl}. "
-                    f"Mulai sesi latihan percakapan pertama kita sekarang sesuai panduan ini: {level_guide}"
+                    f"Berikan pertanyaan latihan pertama beserta pilihan ganda sekarang: {level_guide}"
                 )
+
+            # 0E. Evaluasi Duolingo Grammar & Speaking Saat Ada Kuis Pilihan Ganda yang Sedang Aktif
+            elif teach_language.active_quiz and teach_language.ui_submode == "live" and (
+                user_input.startswith("[TEACH_INPUT]") or user_input == "[TEACH_UNCLEAR]"
+            ):
+                spoken_attempt = (
+                    "" if user_input == "[TEACH_UNCLEAR]" else user_input.replace("[TEACH_INPUT]", "").strip()
+                )
+                status, feedback_text, spoken_assist = teach_language.evaluate_quiz_attempt(
+                    spoken_attempt, bridge
+                )
+
+                if status in ("PARTIAL", "UNCLEAR", "WRONG_GRAMMAR", "MISPRONOUNCED"):
+                    emo = "soft" if status in ("PARTIAL", "UNCLEAR") else "excited"
+                    bridge.expression_signal.emit(emo)
+                    with speech_lock:
+                        loop.run_until_complete(
+                            tts_engine.speak_with_lipsync(
+                                spoken_assist, emotion=emo, subtitle=feedback_text
+                            )
+                        )
+                    bridge.expression_signal.emit("natural")
+                    presence.set_state("idle")
+                    continue
+
+                elif status == "PASS":
+                    # Jawaban & Grammar 100% Benar (Semua Kata Biru!) -> Lanjut ke Pertanyaan Berikutnya
+                    time.sleep(0.65)
+                    user_input = (
+                        f"[TEACH_INPUT] Aku berhasil membaca jawaban '{feedback_text}' dengan grammar dan "
+                        f"pelafalan yang benar! Puji singkat lalu berikan pertanyaan latihan berikutnya."
+                    )
 
             # 1. Penanganan Swap Gender dari Menu Settings
             if user_input.startswith("[SYS_GENDER:"):
@@ -710,8 +768,8 @@ def chat_processor_loop(bridge, tts_engine):
             response = llm_client.chat.completions.create(
                 model=ACTIVE_MODEL,
                 messages=chat_history,
-                temperature=0.75,
-                max_tokens=220
+                temperature=0.72,
+                max_tokens=320
             )
             raw_output = response.choices[0].message.content.strip()
 
@@ -721,7 +779,10 @@ def chat_processor_loop(bridge, tts_engine):
             emotion, display_dialogue, spoken_dialogue = extract_emotion_and_text(raw_output)
             is_chat_mute_mode = teach_language.is_active and (teach_language.ui_submode == "chat")
 
+            # Bangun & tampilkan kotak pilihan ganda Duolingo di UI Live Mode
             if not is_chat_mute_mode:
+                quiz_obj = teach_language.build_quiz_from_llm_or_fallback(raw_output)
+                bridge.quiz_options_signal.emit(json.dumps(quiz_obj))
                 bridge.expression_signal.emit(emotion)
 
             if len(display_dialogue) > 1:
@@ -737,8 +798,6 @@ def chat_processor_loop(bridge, tts_engine):
                     print("[Sistem] Mode Chat Mute aktif — ElevenLabs & suara di-bypass.")
 
             if not is_chat_mute_mode:
-                time.sleep(0.3)
-                bridge.subtitle_signal.emit("")
                 bridge.expression_signal.emit("natural")
 
             presence.set_state("idle")
@@ -758,6 +817,7 @@ if __name__ == "__main__":
 
     app = QApplication(sys.argv)
     bridge = AvatarSignalBridge()
+    teach_language.bridge_ref = bridge
     window = TransparentAvatarWindow(bridge)
     window.show()
 

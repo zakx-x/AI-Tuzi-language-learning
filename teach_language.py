@@ -2,6 +2,8 @@ import io
 import json
 import os
 import re
+import difflib
+import random
 import threading
 import wave
 import audioop
@@ -32,11 +34,11 @@ try:
 except ImportError:
     groq_stt_client = None
 
-# Langsung aktif sejak aplikasi dijalankan
+# Status Utama Aplikasi
 is_active = True
 is_fullscreen = False        # False = Mode Kecil/Minimize (1600x900), True = Full Screen (1920x1080)
 ui_submode = "live"          # "live" (Voice Mic-to-Mic) atau "chat" (Text Chatbot - Total Mute)
-current_gender = "female"    # [DIUBAH]: Default awal sekarang adalah "female" (Main Voice Female)
+current_gender = "female"    # Default Main Voice: "female" (Pink)
 current_female_mode = 1      # 1 = Dandere, 2 = Shy, 3 = Mommy
 custom_personality = ""      # Menyimpan instruksi Personal Intelligence dari user
 target_lang = "en-US"        # en-US, ja-JP, id-ID, ko-KR, zh-CN
@@ -44,6 +46,11 @@ user_level = "Beginner"      # Beginner, Elementary, Intermediate, Advanced, Exp
 selected_mic_index = getattr(config, "MIC_DEVICE_INDEX", None)
 main_input_queue = None
 main_window_ref = None
+bridge_ref = None            # Diisi oleh run_tuzi.py untuk update warna kata real-time
+
+# Menyimpan state kuis pilihan ganda yang sedang aktif di layar
+active_quiz = None
+quiz_turn_counter = 0
 
 LANGUAGE_NAMES = {
     "id-ID": "Indonesian (Bahasa Indonesia)",
@@ -55,29 +62,137 @@ LANGUAGE_NAMES = {
 
 LEVEL_PEDAGOGY = {
     "Beginner": (
-        "LEVEL: BEGINNER (A1). Teach from zero using guided repetition. "
-        "Explain briefly in Indonesian/English, give Zak 1 simple word or short daily phrase in the target language "
-        "(include romaji/pinyin if Japanese/Korean/Chinese), and ask him to repeat it."
+        "LEVEL: BEGINNER (A1). Create very short, basic daily questions (2-5 words per option) "
+        "such as greetings, 'nama saya...', 'saya berasal dari...', or simple daily nouns/verbs."
     ),
     "Elementary": (
-        "LEVEL: ELEMENTARY (A2). Use simple daily Q&A (hobbies, food, daily routine). "
-        "Mix simple target language sentences with brief explanations, and gently correct basic grammar."
+        "LEVEL: ELEMENTARY (A2). Create simple daily conversation questions (4-7 words per option) "
+        "testing basic tense, particles, and word order."
     ),
     "Intermediate": (
-        "LEVEL: INTERMEDIATE (B1-B2). Use 85-90% target language in a fun real-life roleplay scenario "
-        "(e.g. ordering at a cafe, traveling, casual hangout). Correct unnatural phrasing briefly first."
+        "LEVEL: INTERMEDIATE (B1-B2). Create situational roleplay questions (5-9 words per option) "
+        "testing natural grammar connectors and prepositions."
     ),
     "Advanced": (
-        "LEVEL: ADVANCED (C1). Speak 100% in the target language. Discuss interesting topics (movies, tech, daily life), "
-        "introduce natural idioms/slang, and refine subtle grammar or word choices."
+        "LEVEL: ADVANCED (C1). Create discussion questions (6-11 words per option) "
+        "testing complex grammar structures and natural phrasing."
     ),
     "Expert": (
-        "LEVEL: EXPERT (C2). Speak 100% in the target language at natural native pace with authentic expressions/slang. "
-        "Challenge Zak with engaging follow-up questions and polish any minor nuance errors."
+        "LEVEL: EXPERT (C2). Create nuanced native-level questions (7-12 words per option) "
+        "testing subtle grammar accuracy and idiomatic expressions."
     ),
 }
 
-# Diisi oleh run_tuzi.py -> dipakai untuk Discord Rich Presence
+# Bank Kuis Cadangan (Fallback) jika respons LLM tidak menyertakan JSON kuis
+FALLBACK_QUIZ_BANK = {
+    "id-ID": [
+        {
+            "question": "Bagaimana cara memperkenalkan asal negaramu dengan grammar yang benar?",
+            "options": [
+                {"text": "Saya berasal dari Korea", "native": "Saya berasal dari Korea", "is_correct": True},
+                {"text": "Saya asal dari di Korea", "native": "Saya asal dari di Korea", "is_correct": False},
+                {"text": "Dari Korea berasal saya", "native": "Dari Korea berasal saya", "is_correct": False},
+            ],
+        },
+        {
+            "question": "Pilih dan bacalah kalimat perkenalan nama yang paling tepat!",
+            "options": [
+                {"text": "Halo nama saya adalah Zak", "native": "Halo nama saya adalah Zak", "is_correct": True},
+                {"text": "Halo saya punya nama Zak itu", "native": "Halo saya punya nama Zak itu", "is_correct": False},
+                {"text": "Nama adalah saya Zak halo", "native": "Nama adalah saya Zak halo", "is_correct": False},
+            ],
+        },
+        {
+            "question": "Bagaimana cara mengatakan kamu sedang belajar bahasa dengan benar?",
+            "options": [
+                {"text": "Saya sedang belajar bahasa Indonesia", "native": "Saya sedang belajar bahasa Indonesia", "is_correct": True},
+                {"text": "Saya lagi belajar akan bahasa Indonesia", "native": "Saya lagi belajar akan bahasa Indonesia", "is_correct": False},
+                {"text": "Belajar sedang saya bahasa Indonesia", "native": "Belajar sedang saya bahasa Indonesia", "is_correct": False},
+            ],
+        },
+    ],
+    "en-US": [
+        {
+            "question": "How do you correctly say 'Saya berasal dari Korea' in English?",
+            "options": [
+                {"text": "I come from Korea", "native": "I come from Korea", "is_correct": True},
+                {"text": "I am come from Korea", "native": "I am come from Korea", "is_correct": False},
+                {"text": "I coming from the Korea", "native": "I coming from the Korea", "is_correct": False},
+            ],
+        },
+        {
+            "question": "Which sentence uses the correct English grammar to introduce yourself?",
+            "options": [
+                {"text": "My name is Zak and I am a student", "native": "My name is Zak and I am a student", "is_correct": True},
+                {"text": "My name Zak and I student am", "native": "My name Zak and I student am", "is_correct": False},
+                {"text": "I am have name Zak a student", "native": "I am have name Zak a student", "is_correct": False},
+            ],
+        },
+        {
+            "question": "How do you say you have been studying English for two years?",
+            "options": [
+                {"text": "I have been learning English", "native": "I have been learning English", "is_correct": True},
+                {"text": "I am have learning English", "native": "I am have learning English", "is_correct": False},
+                {"text": "I been learn English yesterday", "native": "I been learn English yesterday", "is_correct": False},
+            ],
+        },
+    ],
+    "ja-JP": [
+        {
+            "question": "Bagaimana cara mengatakan 'Saya berasal dari Korea' dalam bahasa Jepang?",
+            "options": [
+                {"text": "Watashi wa Kankoku kara kimashita", "native": "私は韓国から来ました", "is_correct": True},
+                {"text": "Watashi no Kankoku ni kimashita", "native": "私の韓国に来ました", "is_correct": False},
+                {"text": "Watashi wa Kankoku o ikimasu", "native": "私は韓国を行きます", "is_correct": False},
+            ],
+        },
+        {
+            "question": "Pilih kalimat perkenalan nama dalam bahasa Jepang dengan partikel yang benar!",
+            "options": [
+                {"text": "Hajimemashite watashi no namae wa Zak desu", "native": "はじめまして私の名前はザックです", "is_correct": True},
+                {"text": "Hajimemashite watashi wa namae no Zak desu", "native": "はじめまして私は名前のザックです", "is_correct": False},
+                {"text": "Watashi namae o Zak ni desu", "native": "私名前をザックにです", "is_correct": False},
+            ],
+        },
+    ],
+    "ko-KR": [
+        {
+            "question": "Bagaimana cara mengatakan 'Saya berasal dari Korea' dalam bahasa Korea?",
+            "options": [
+                {"text": "Jeoneun Hangug-eseo wasseoyo", "native": "저는 한국에서 왔어요", "is_correct": True},
+                {"text": "Jeoneun Hangug-eul wasseoyo", "native": "저는 한국을 왔어요", "is_correct": False},
+                {"text": "Nae-ga Hangug-eseo gayo", "native": "내가 한국에서 가요", "is_correct": False},
+            ],
+        },
+        {
+            "question": "Pilih kalimat perkenalan 'Nama saya Zak' dengan grammar Korea yang benar!",
+            "options": [
+                {"text": "Je ireumeun Zak imnida", "native": "제 이름은 자크입니다", "is_correct": True},
+                {"text": "Je ireum-eul Zak imnida", "native": "제 이름을 자크입니다", "is_correct": False},
+                {"text": "Jeoneun ireum Zak-eseo imnida", "native": "저는 이름 자크에서입니다", "is_correct": False},
+            ],
+        },
+    ],
+    "zh-CN": [
+        {
+            "question": "Bagaimana cara mengatakan 'Saya berasal dari Korea' dalam bahasa Mandarin?",
+            "options": [
+                {"text": "Wo lai zi Hanguo", "native": "我来自韩国", "is_correct": True},
+                {"text": "Wo shi lai Hanguo de ren", "native": "我是来韩国的人", "is_correct": False},
+                {"text": "Wo zai Hanguo lai le", "native": "我在韩国来了", "is_correct": False},
+            ],
+        },
+        {
+            "question": "Pilih kalimat 'Nama saya adalah Zak' dengan susunan grammar Mandarin yang benar!",
+            "options": [
+                {"text": "Wo de mingzi jiao Zak", "native": "我的名字叫扎克", "is_correct": True},
+                {"text": "Wo jiao de mingzi shi Zak", "native": "我叫的名字是扎克", "is_correct": False},
+                {"text": "Mingzi wo shi Zak jiao", "native": "名字我是扎克叫", "is_correct": False},
+            ],
+        },
+    ],
+}
+
 presence_callback = None
 
 
@@ -95,9 +210,247 @@ TEACH_WIN_HEIGHT = 900
 FULLSCREEN_WIN_WIDTH = 1920
 FULLSCREEN_WIN_HEIGHT = 1080
 
-# Ukuran Asli Mode Overlay Desktop
 DEFAULT_WIN_WIDTH = 600
 DEFAULT_WIN_HEIGHT = 1300
+
+
+def normalize_word(w: str) -> str:
+    """Membersihkan tanda baca dan mengubah kata menjadi huruf kecil untuk pencocokan."""
+    return re.sub(r"[^\w\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]", "", w.lower()).strip()
+
+
+def match_spoken_to_option(spoken_text: str, option_obj: dict) -> tuple[list[bool], float]:
+    """
+    Mencocokkan ucapan user kata demi kata terhadap teks pilihan ganda.
+    Mengembalikan (daftar_boolean_kata_terdeteksi, rasio_kecocokan_total).
+    """
+    display_text = option_obj.get("text", "").strip()
+    native_text = option_obj.get("native", display_text).strip()
+
+    display_words = [w for w in display_text.split() if w.strip()]
+    if not display_words:
+        return [], 0.0
+
+    norm_display_words = [normalize_word(w) for w in display_words]
+    spoken_clean = normalize_word(spoken_text)
+    if not spoken_clean:
+        return [False] * len(display_words), 0.0
+
+    spoken_tokens = [normalize_word(t) for t in spoken_text.split() if normalize_word(t)]
+
+    # 1. Pencocokan kata demi kata (Latin / Romaji / Pinyin / Indonesia / Inggris)
+    matched_flags = [False] * len(display_words)
+    used_spoken_indices = set()
+
+    for i, target_w in enumerate(norm_display_words):
+        if not target_w:
+            continue
+        for j, spoken_w in enumerate(spoken_tokens):
+            if j in used_spoken_indices:
+                continue
+            # Cocok persis atau kemiripan fonetik >= 0.76
+            sim = difflib.SequenceMatcher(None, target_w, spoken_w).ratio()
+            if target_w == spoken_w or sim >= 0.76 or (len(target_w) >= 4 and target_w in spoken_w):
+                matched_flags[i] = True
+                used_spoken_indices.add(j)
+                break
+
+    word_match_ratio = sum(1 for m in matched_flags if m) / len(display_words)
+
+    # 2. Pencocokan karakter Native (Jika STT menghasilkan huruf Jepang/Korea/Mandarin asli)
+    native_clean = normalize_word(native_text)
+    if native_clean and word_match_ratio < 0.35:
+        matched_chars = 0
+        for ch in native_clean:
+            if ch in spoken_clean:
+                matched_chars += 1
+        char_ratio = matched_chars / max(1, len(native_clean))
+        if char_ratio > word_match_ratio:
+            num_words_matched = int(round(char_ratio * len(display_words)))
+            matched_flags = [idx < num_words_matched for idx in range(len(display_words))]
+            word_match_ratio = char_ratio
+
+    return matched_flags, word_match_ratio
+
+
+def build_quiz_from_llm_or_fallback(raw_llm_output: str) -> dict:
+    """Mengekstrak [QUIZ_DATA: {...}] dari output LLM atau menggunakan kuis cadangan jika gagal."""
+    global active_quiz, quiz_turn_counter
+
+    quiz_match = re.search(r"\[QUIZ_DATA:\s*(\{.*?\})\s*\]", raw_llm_output, flags=re.IGNORECASE | re.DOTALL)
+    parsed_options = []
+
+    if quiz_match:
+        try:
+            data = json.loads(quiz_match.group(1))
+            if "options" in data and isinstance(data["options"], list):
+                for opt in data["options"]:
+                    if isinstance(opt, dict) and opt.get("text"):
+                        parsed_options.append({
+                            "text": str(opt["text"]).strip(),
+                            "native": str(opt.get("native", opt["text"])).strip(),
+                            "is_correct": bool(opt.get("is_correct", False)),
+                        })
+            elif "correct" in data:
+                parsed_options = [
+                    {
+                        "text": str(data["correct"]).strip(),
+                        "native": str(data.get("correct_native", data["correct"])).strip(),
+                        "is_correct": True,
+                    },
+                    {
+                        "text": str(data.get("wrong1", "")).strip(),
+                        "native": str(data.get("wrong1_native", data.get("wrong1", ""))).strip(),
+                        "is_correct": False,
+                    },
+                    {
+                        "text": str(data.get("wrong2", "")).strip(),
+                        "native": str(data.get("wrong2_native", data.get("wrong2", ""))).strip(),
+                        "is_correct": False,
+                    },
+                ]
+                parsed_options = [o for o in parsed_options if o["text"]]
+        except Exception as e:
+            print(f"[Quiz Parser Warning] Gagal parse JSON kuis dari LLM: {e}")
+
+    # Jika LLM tidak menyertakan minimal 2 opsi valid, gunakan bank kuis sesuai bahasa
+    if len(parsed_options) < 2 or not any(o["is_correct"] for o in parsed_options):
+        bank = FALLBACK_QUIZ_BANK.get(target_lang, FALLBACK_QUIZ_BANK["en-US"])
+        item = bank[quiz_turn_counter % len(bank)]
+        quiz_turn_counter += 1
+        parsed_options = [dict(o) for o in item["options"]]
+
+    random.shuffle(parsed_options)
+    active_quiz = {"options": parsed_options}
+    return active_quiz
+
+
+def update_live_partial_quiz_ui(partial_spoken: str):
+    """
+    Mengubah warna kata dari Abu-abu menjadi Biru secara real-time (gaya Duolingo)
+    saat user sedang berbicara di mikrofon.
+    """
+    if not active_quiz or not bridge_ref or not partial_spoken.strip():
+        return
+
+    options = active_quiz.get("options", [])
+    best_idx = -1
+    best_ratio = 0.0
+    best_flags = []
+
+    for idx, opt in enumerate(options):
+        flags, ratio = match_spoken_to_option(partial_spoken, opt)
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_idx = idx
+            best_flags = flags
+
+    if best_idx >= 0 and best_ratio > 0.0:
+        word_states = ["blue" if m else "grey" for m in best_flags]
+        payload = {
+            "optionIndex": best_idx,
+            "wordStates": word_states,
+            "boxState": "detecting",
+        }
+        bridge_ref.quiz_state_signal.emit(json.dumps(payload))
+
+
+def evaluate_quiz_attempt(spoken_text: str, bridge) -> tuple[str, str, str]:
+    """
+    Mengevaluasi bacaan user setelah melepas tombol mikrofon:
+    - 'PASS': Semua kata pada jawaban yang benar terdeteksi (>= 82%) -> Biru semua!
+    - 'PARTIAL': Baru sebagian kata jawaban benar yang terdeteksi (misal 'saya berasal' dari 'saya berasal dari korea') -> Kata sisa jadi Kuning & minta ulang!
+    - 'UNCLEAR': Suara tidak tertangkap sama sekali -> Teks jawaban jadi Kuning & minta ulang!
+    - 'WRONG_GRAMMAR': User membaca opsi yang grammar-nya salah atau salah ucap -> AI membacakan jawaban yang benar untuk diikuti!
+    """
+    global active_quiz
+    if not active_quiz:
+        return "NONE", "", ""
+
+    options = active_quiz.get("options", [])
+    correct_idx = next((i for i, o in enumerate(options) if o.get("is_correct")), 0)
+    correct_opt = options[correct_idx]
+    correct_text = correct_opt["text"]
+    correct_words = [w for w in correct_text.split() if w.strip()]
+
+    # 1. Jika suara kosong / tidak tertangkap sama sekali -> Warna Kuning (Minta baca ulang)
+    if not spoken_text or not spoken_text.strip():
+        payload = {
+            "optionIndex": correct_idx,
+            "wordStates": ["yellow"] * len(correct_words),
+            "boxState": "yellow",
+        }
+        bridge.quiz_state_signal.emit(json.dumps(payload))
+        msg = "Suaramu belum terdengar jelas. Coba baca kembali kalimat yang berwarna kuning ya!"
+        return "UNCLEAR", msg, msg
+
+    # Hitung kecocokan terhadap opsi yang benar dan opsi pengecoh
+    corr_flags, corr_ratio = match_spoken_to_option(spoken_text, correct_opt)
+
+    best_wrong_idx = -1
+    best_wrong_ratio = 0.0
+    for idx, opt in enumerate(options):
+        if idx == correct_idx:
+            continue
+        _, w_ratio = match_spoken_to_option(spoken_text, opt)
+        if w_ratio > best_wrong_ratio:
+            best_wrong_ratio = w_ratio
+            best_wrong_idx = idx
+
+    # 2. Jika user membaca opsi dengan GRAMMAR SALAH (kecocokan ke opsi salah tinggi)
+    if best_wrong_ratio >= 0.65 and best_wrong_ratio > corr_ratio + 0.15:
+        wrong_words = options[best_wrong_idx]["text"].split()
+        bridge.quiz_state_signal.emit(json.dumps({
+            "optionIndex": best_wrong_idx,
+            "wordStates": ["wrong"] * len(wrong_words),
+            "boxState": "wrong",
+        }))
+        # Tandai jawaban yang benar dengan warna kuning & minta AI membacakannya
+        bridge.quiz_state_signal.emit(json.dumps({
+            "optionIndex": correct_idx,
+            "wordStates": ["yellow"] * len(correct_words),
+            "boxState": "yellow",
+            "highlightAssist": True,
+        }))
+        assist_msg = f"Pilihan itu grammar-nya kurang tepat. Ikuti cara bacaku ya: {correct_text}"
+        return "WRONG_GRAMMAR", assist_msg, assist_msg
+
+    # 3. Jika SEMUA kata (atau >= 82% kata) pada jawaban yang benar terdeteksi -> 100% BIRU (LULUS!)
+    if corr_ratio >= 0.82 or all(corr_flags):
+        bridge.quiz_state_signal.emit(json.dumps({
+            "optionIndex": correct_idx,
+            "wordStates": ["blue"] * len(correct_words),
+            "boxState": "blue",
+        }))
+        return "PASS", correct_text, ""
+
+    # 4. Jika HANYA SEBAGIAN kata yang terdeteksi (misal: 'saya berasal' dari 'saya berasal dari korea')
+    # Kata yang terdeteksi jadi BIRU, sisa kata yang belum terbaca jadi KUNING!
+    if sum(1 for f in corr_flags if f) >= 1:
+        word_states = ["blue" if f else "yellow" for f in corr_flags]
+        detected_words_str = " ".join(
+            w for w, f in zip(correct_words, corr_flags) if f
+        )
+        bridge.quiz_state_signal.emit(json.dumps({
+            "optionIndex": correct_idx,
+            "wordStates": word_states,
+            "boxState": "yellow",
+        }))
+        retry_msg = (
+            f"Baru terdengar '{detected_words_str}'. "
+            f"Coba baca ulang kalimat lengkapnya yang berwarna kuning ya!"
+        )
+        return "PARTIAL", retry_msg, retry_msg
+
+    # 5. Jika user salah mengucapkan kata-katanya sama sekali -> AI memberi bantuan membacakannya!
+    bridge.quiz_state_signal.emit(json.dumps({
+        "optionIndex": correct_idx,
+        "wordStates": ["yellow"] * len(correct_words),
+        "boxState": "yellow",
+        "highlightAssist": True,
+    }))
+    assist_msg = f"Pelafalannya belum pas. Dengarkan dan ikuti cara bacaku ya: {correct_text}"
+    return "MISPRONOUNCED", assist_msg, assist_msg
 
 
 def get_available_microphones() -> list:
@@ -116,10 +469,7 @@ def get_available_microphones() -> list:
 
 
 def clean_voice_audio(raw_pcm: bytes, sample_rate: int = 16000) -> bytes:
-    """
-    Membersihkan rekaman suara dengan Noise Suppression (Spectral Gating)
-    dan Auto-Gain Normalization agar suara manusia terdengar jernih.
-    """
+    """Membersihkan rekaman suara dengan Noise Suppression & Auto-Gain."""
     if not raw_pcm:
         return raw_pcm
 
@@ -226,9 +576,10 @@ class HoldToTalkRecorder:
         self.is_recording = False
         self.frames = []
         self.lang = "en-US"
+        self._partial_lock = threading.Lock()
 
     def start_recording(self, payload="en-US"):
-        global target_lang, user_level, ui_submode, current_gender, current_female_mode, custom_personality, selected_mic_index
+        global target_lang, user_level, ui_submode, current_gender, current_female_mode, custom_personality, selected_mic_index, active_quiz
 
         # 1. Perintah Keluar Instan dari Tombol Hang-up Merah
         if payload == "CMD:EXIT":
@@ -246,8 +597,22 @@ class HoldToTalkRecorder:
             set_fullscreen_state(not is_fullscreen)
             return
 
-        # 3. Perintah Onboarding: Sapaan Awal -> Pilih Bahasa -> Pilih Level
+        # 3. Perintah Tombol Volume (🔊) di Kiri Teks Pilihan Ganda -> Tuzi Membacakan Kalimat Tersebut
+        if payload.startswith("READ_OPTION:"):
+            try:
+                opt_idx = int(payload.split(":", 1)[1].strip())
+                if active_quiz and 0 <= opt_idx < len(active_quiz.get("options", [])):
+                    opt_text = active_quiz["options"][opt_idx]["text"]
+                    stop_all_voice_playback()
+                    if main_input_queue:
+                        main_input_queue.put(f"[SYS_READ_OPTION:{opt_idx}:{opt_text}]")
+            except Exception as e:
+                print(f"[READ_OPTION Error] {e}")
+            return
+
+        # 4. Perintah Onboarding: Sapaan Awal -> Pilih Bahasa -> Pilih Level
         if payload == "ONBOARD:START":
+            active_quiz = None
             if main_input_queue:
                 main_input_queue.put("[SYS_ONBOARD_GREET]")
             return
@@ -255,6 +620,7 @@ class HoldToTalkRecorder:
             chosen_lang = payload.split(":", 2)[2].strip()
             target_lang = chosen_lang
             self.lang = chosen_lang
+            active_quiz = None
             stop_all_voice_playback()
             print(f"\n[TUZI ONBOARDING] Bahasa dipilih: {LANGUAGE_NAMES.get(target_lang, target_lang)}")
             if main_input_queue:
@@ -263,13 +629,14 @@ class HoldToTalkRecorder:
         elif payload.startswith("ONBOARD:LEVEL:"):
             chosen_level = payload.split(":", 2)[2].strip()
             user_level = chosen_level
+            active_quiz = None
             stop_all_voice_playback()
             print(f"\n[TUZI ONBOARDING] Level dipilih: {user_level} ({target_lang})")
             if main_input_queue:
                 main_input_queue.put(f"[SYS_ONBOARD_LEVEL:{user_level}]")
             return
 
-        # 4. Perintah Pindah Tab (LIVE / CHAT)
+        # 5. Perintah Pindah Tab (LIVE / CHAT)
         if payload == "MODE:LIVE":
             ui_submode = "live"
             print("\n[TUZI UI] Beralih ke tab LIVE (Voice Mode Aktif).")
@@ -280,7 +647,7 @@ class HoldToTalkRecorder:
             print("\n[TUZI UI] Beralih ke tab CHAT (Total Mute Aktif).")
             return
 
-        # 5. Perintah Pilih Perangkat Mikrofon dari Menu Settings
+        # 6. Perintah Pilih Perangkat Mikrofon dari Menu Settings
         if payload.startswith("MIC_DEV:"):
             val = payload.split(":")[1].strip()
             if val == "DEFAULT" or val == "":
@@ -294,7 +661,7 @@ class HoldToTalkRecorder:
                     selected_mic_index = None
             return
 
-        # 6. Perintah Swap Gender dari Settings (MALE / FEMALE)
+        # 7. Perintah Swap Gender dari Settings (MALE / FEMALE)
         if payload.startswith("GENDER:"):
             new_gender = payload.split(":")[1].lower()
             current_gender = new_gender
@@ -303,7 +670,7 @@ class HoldToTalkRecorder:
                 main_input_queue.put(f"[SYS_GENDER:{current_gender}]")
             return
 
-        # 7. Perintah Ganti Tipe Suara Female (1=Dandere, 2=Shy, 3=Mommy)
+        # 8. Perintah Ganti Tipe Suara Female (1=Dandere, 2=Shy, 3=Mommy)
         if payload.startswith("FMODE:"):
             try:
                 fmode = int(payload.split(":")[1])
@@ -315,7 +682,7 @@ class HoldToTalkRecorder:
                 pass
             return
 
-        # 8. Perintah Personal Intelligence (Custom Personality dari User)
+        # 9. Perintah Personal Intelligence (Custom Personality dari User)
         if payload.startswith("CUSTOM_PROMPT:"):
             custom_text = payload[len("CUSTOM_PROMPT:"):].strip()
             custom_personality = custom_text
@@ -327,7 +694,7 @@ class HoldToTalkRecorder:
                 main_input_queue.put(f"[SYS_CUSTOM_PROMPT:{custom_text}]")
             return
 
-        # 9. Pesan Teks dari Mode Chatbot (Total Mute)
+        # 10. Pesan Teks dari Mode Chatbot (Total Mute)
         if payload.startswith("CHAT:"):
             chat_text = payload[5:].strip()
             if chat_text and main_input_queue:
@@ -337,7 +704,7 @@ class HoldToTalkRecorder:
                 main_input_queue.put(f"[TEACH_INPUT] {chat_text}")
             return
 
-        # 10. Rekaman Suara Push-to-Talk pada Avatar Blob (Hanya di Mode Live)
+        # 11. Rekaman Suara Push-to-Talk pada Avatar Blob / Kotak Kuis (Mode Live)
         if ui_submode == "chat" or self.is_recording:
             return
         self.lang = payload
@@ -348,10 +715,7 @@ class HoldToTalkRecorder:
         threading.Thread(target=self._record_loop, daemon=True).start()
 
     def _transcribe_audio(self, cleaned_pcm: bytes, sample_rate: int, sample_width: int) -> str:
-        """
-        Menerjemahkan rekaman suara menggunakan Whisper Large V3 Turbo (jika GROQ_API_KEY aktif)
-        atau Google STT dengan audio yang sudah dibersihkan oleh Noise Suppression.
-        """
+        """Menerjemahkan rekaman suara menggunakan Whisper Large V3 Turbo atau Google STT."""
         if groq_stt_client is not None:
             try:
                 wav_buf = io.BytesIO()
@@ -362,7 +726,7 @@ class HoldToTalkRecorder:
                     wf.writeframes(cleaned_pcm)
                 wav_buf.seek(0)
 
-                iso_lang = self.lang.split("-")[0].lower()  # "en", "ja", "id", "ko", "zh"
+                iso_lang = self.lang.split("-")[0].lower()
                 transcription = groq_stt_client.audio.transcriptions.create(
                     file=("speech.wav", wav_buf.read()),
                     model="whisper-large-v3-turbo",
@@ -377,6 +741,25 @@ class HoldToTalkRecorder:
         audio_data = sr.AudioData(cleaned_pcm, sample_rate, sample_width)
         return self.recognizer.recognize_google(audio_data, language=self.lang)
 
+    def _run_live_partial_check(self, raw_snapshot: bytes, sample_rate: int, sample_width: int):
+        """Mendeteksi kata secara real-time saat user masih berbicara agar teks langsung berubah biru."""
+        if not self._partial_lock.acquire(blocking=False):
+            return
+        try:
+            if not self.is_recording or not active_quiz:
+                return
+            rms = audioop.rms(raw_snapshot, sample_width)
+            if rms < 60:
+                return
+            audio_data = sr.AudioData(raw_snapshot, sample_rate, sample_width)
+            partial_text = self.recognizer.recognize_google(audio_data, language=self.lang)
+            if partial_text and self.is_recording:
+                update_live_partial_quiz_ui(partial_text)
+        except Exception:
+            pass
+        finally:
+            self._partial_lock.release()
+
     def _record_loop(self):
         queued = False
         try:
@@ -389,12 +772,24 @@ class HoldToTalkRecorder:
             with sr.Microphone(**mic_kwargs) as source:
                 sample_rate = source.SAMPLE_RATE
                 sample_width = source.SAMPLE_WIDTH
-                print(f"\n[TEACH MIC - {self.lang}] Mendengarkan... (Silakan bicara)")
+                print(f"\n[TEACH MIC - {self.lang}] Mendengarkan... (Silakan baca jawaban)")
 
                 min_chunks = 6
+                chunk_counter = 0
                 while self.is_recording or len(self.frames) < min_chunks:
                     buffer = source.stream.read(source.CHUNK)
                     self.frames.append(buffer)
+                    chunk_counter += 1
+
+                    # Setiap ~0.75 detik saat menahan mic, cek kata yang sudah diucapkan agar berubah biru
+                    if self.is_recording and active_quiz and chunk_counter % 12 == 0:
+                        snapshot = b"".join(self.frames)
+                        threading.Thread(
+                            target=self._run_live_partial_check,
+                            args=(snapshot, sample_rate, sample_width),
+                            daemon=True,
+                        ).start()
+
                     if not self.is_recording and len(self.frames) >= min_chunks:
                         break
 
@@ -405,7 +800,7 @@ class HoldToTalkRecorder:
             rms_level = audioop.rms(raw_data, sample_width)
             print(f"[TEACH MIC] Memproses suara Zak (Level Input Mic: {rms_level})...")
             if rms_level < 25:
-                print("[TEACH MIC] Peringatan: Sinyal mikrofon sangat kecil/kosong. Cek pilihan Mic di menu Settings!")
+                print("[TEACH MIC] Peringatan: Sinyal mikrofon sangat kecil/kosong.")
 
             cleaned_pcm = clean_voice_audio(raw_data, sample_rate=sample_rate)
 
@@ -415,9 +810,15 @@ class HoldToTalkRecorder:
                 main_input_queue.put(f"[TEACH_INPUT] {text.strip()}")
                 queued = True
                 _set_presence("thinking")
+            elif active_quiz and main_input_queue:
+                main_input_queue.put("[TEACH_UNCLEAR]")
+                queued = True
 
         except sr.UnknownValueError:
-            print("[TEACH MIC] Suara tidak terdengar jelas. Coba bicara lebih dekat atau ganti Mic di Settings.")
+            print("[TEACH MIC] Suara tidak terdengar jelas.")
+            if active_quiz and main_input_queue:
+                main_input_queue.put("[TEACH_UNCLEAR]")
+                queued = True
         except Exception as e:
             print(f"[TEACH MIC Error] Gagal mengakses mikrofon: {e}")
         finally:
@@ -432,7 +833,7 @@ ptt_recorder = HoldToTalkRecorder()
 
 
 def handle_teach_mode(user_input: str, bridge):
-    """Menangani input selama aplikasi Tuzi 1.0 berjalan & menyuntikkan konteks Bahasa + Level."""
+    """Menangani input selama aplikasi Tuzi 1.0 berjalan & meminta LLM membuat Kuis Pilihan Ganda."""
     global is_active, custom_personality
 
     if user_input.startswith("[SYS_CUSTOM_PROMPT:"):
@@ -456,17 +857,24 @@ def handle_teach_mode(user_input: str, bridge):
     if is_active and is_teach_input:
         lang_label = LANGUAGE_NAMES.get(target_lang, target_lang)
         level_guide = LEVEL_PEDAGOGY.get(user_level, LEVEL_PEDAGOGY["Beginner"])
+        script_rule = (
+            "Write 'text' in clear Romanized script (Romaji/Pinyin/Revised Romanization) with spaces between words so Zak can read it word-by-word, and put the native characters in 'native'."
+            if target_lang in ["ja-JP", "ko-KR", "zh-CN"]
+            else "Write 'text' and 'native' in standard target language words separated by spaces."
+        )
         persona_rule = (
             f"IMPORTANT PERSONAL INTELLIGENCE OVERRIDE: You MUST adopt this exact attitude and speaking style: '{custom_personality}'. "
             if custom_personality
             else "Keep your current persona mode. "
         )
         user_input += (
-            f"\n\n[SYSTEM INFO - LANGUAGE TUTOR ACTIVE | Target Language: {lang_label} | Proficiency: {user_level}: "
+            f"\n\n[SYSTEM INFO - DUOLINGO SPEAKING & GRAMMAR TUTOR | Target Language: {lang_label} | Level: {user_level}: "
             f"1. {persona_rule}"
             f"2. {level_guide} "
-            "3. If Zak's grammar or phrasing is unnatural, briefly correct it first. "
-            "4. Keep your reply concise, natural, and under 22 words!]"
+            "3. Ask Zak a short conversational question or grammar challenge (under 18 words). "
+            "4. MANDATORY: At the very end of your reply, append a JSON block in this EXACT format with 1 grammatically correct answer and 2 grammatically incorrect distractors for Zak to choose and read aloud: "
+            f'[QUIZ_DATA: {{"options": [{{"text": "Correct sentence here", "native": "Native script here", "is_correct": true}}, {{"text": "Wrong grammar 1", "native": "Wrong 1", "is_correct": false}}, {{"text": "Wrong grammar 2", "native": "Wrong 2", "is_correct": false}}]}}] '
+            f"5. {script_rule}]"
         )
 
     return user_input
@@ -497,7 +905,7 @@ def apply_window_state(window, active: bool):
 
 
 def get_ui_injection_js() -> str:
-    """Menyuntikkan UI dengan Main Voice Default Female (Pink) & Pop-Up Bubble Choice Box 2 Baris."""
+    """Menyuntikkan UI dengan Duolingo-Style Speaking & Grammar Quiz Boxes (Logo Volume + Kata Abu/Biru/Kuning)."""
     qwebchannel_code = get_qwebchannel_js()
     mics_json = json.dumps(get_available_microphones())
 
@@ -574,7 +982,7 @@ def get_ui_injection_js() -> str:
                 body.teach-mode-active.dark-mode #tuzi-subtitle-box { color: #FFFFFF !important; }
 
                 body.teach-mode-active.choices-active #tuzi-subtitle-box {
-                    top: calc(50% - 18px) !important;
+                    top: calc(50% - 22px) !important;
                 }
 
                 #tuzi-teach-overlay {
@@ -595,15 +1003,15 @@ def get_ui_injection_js() -> str:
                     transition: transform 0.48s cubic-bezier(0.34, 1.56, 0.64, 1), top 0.48s cubic-bezier(0.34, 1.56, 0.64, 1);
                 }
                 body.teach-mode-active.choices-active #ai-blob-stage {
-                    top: 27%;
-                    transform: translate(-50%, -50%) scale(0.80);
+                    top: 26%;
+                    transform: translate(-50%, -50%) scale(0.78);
                 }
 
-                /* === CONTAINER & BUBBLE BOX PILIHAN BAHASA / LEVEL (2 BARIS: 3 ATAS, 2 BAWAH) === */
+                /* === CONTAINER PILIHAN BAHASA, LEVEL, & KUIS GRAMMAR DUOLINGO === */
                 #tuzi-choice-container {
                     pointer-events: auto;
                     position: fixed;
-                    top: calc(50% + 42px);
+                    top: calc(50% + 36px);
                     left: 50%;
                     transform: translateX(-50%);
                     display: none;
@@ -611,7 +1019,7 @@ def get_ui_injection_js() -> str:
                     align-items: center;
                     justify-content: center;
                     width: 92%;
-                    max-width: 680px;
+                    max-width: 720px;
                     z-index: 999994;
                     box-sizing: border-box;
                 }
@@ -619,6 +1027,7 @@ def get_ui_injection_js() -> str:
                     display: flex;
                 }
 
+                /* Box Pilihan Bahasa & Level (2 Baris: 3 Atas, 2 Bawah) */
                 .tuzi-choice-box {
                     min-width: 184px;
                     height: 62px;
@@ -655,6 +1064,121 @@ def get_ui_injection_js() -> str:
                 }
                 .tuzi-choice-box:active {
                     transform: scale(0.95);
+                }
+
+                /* === BOX PILIHAN GANDA GRAMMAR & SPEAKING (GAYA DUOLINGO) === */
+                .tuzi-quiz-box {
+                    position: relative;
+                    width: 100%;
+                    max-width: 580px;
+                    min-height: 60px;
+                    padding: 12px 22px 12px 16px;
+                    margin: 7px 0 !important;
+                    background: #FFFFFF;
+                    border: 2px solid rgba(156, 163, 175, 0.42);
+                    border-radius: 20px;
+                    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.06);
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    cursor: pointer;
+                    user-select: none;
+                    box-sizing: border-box;
+                    opacity: 0;
+                    transform: translateY(18px) scale(0.85);
+                    animation: bubblePopUp 0.42s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+                    transition:
+                        border-color 0.25s ease,
+                        box-shadow 0.25s ease,
+                        transform 0.2s ease;
+                }
+                .tuzi-quiz-box:hover {
+                    border-color: rgba(107, 114, 128, 0.68);
+                    box-shadow: 0 10px 26px rgba(0, 0, 0, 0.10);
+                }
+
+                /* Status Box saat Mendeteksi / Benar (BIRU) */
+                .tuzi-quiz-box.state-detecting,
+                .tuzi-quiz-box.state-blue {
+                    border-color: #3B82F6 !important;
+                    box-shadow: 0 10px 28px rgba(59, 130, 246, 0.22) !important;
+                }
+                /* Status Box saat Meminta User Membaca Ulang (KUNING) */
+                .tuzi-quiz-box.state-yellow {
+                    border-color: #F59E0B !important;
+                    box-shadow: 0 10px 28px rgba(245, 158, 11, 0.24) !important;
+                }
+                /* Status Box saat Grammar Salah */
+                .tuzi-quiz-box.state-wrong {
+                    border-color: #EF4444 !important;
+                    box-shadow: 0 10px 26px rgba(239, 68, 68, 0.20) !important;
+                }
+
+                /* Tombol Logo Volume di Kiri Teks */
+                .quiz-vol-btn {
+                    width: 38px;
+                    height: 38px;
+                    border-radius: 12px;
+                    background: #F3F4F6;
+                    border: 1.5px solid rgba(156, 163, 175, 0.35);
+                    color: #6B7280;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    cursor: pointer;
+                    margin-right: 14px;
+                    flex-shrink: 0;
+                    transition: all 0.2s ease;
+                    outline: none;
+                }
+                .quiz-vol-btn:hover {
+                    background: #E0E7FF;
+                    border-color: #3B82F6;
+                    color: #2563EB;
+                    transform: scale(1.08);
+                }
+                .quiz-vol-btn.playing {
+                    background: #DBEAFE;
+                    border-color: #3B82F6;
+                    color: #2563EB;
+                    animation: volPulse 0.9s ease-in-out infinite;
+                }
+                @keyframes volPulse {
+                    0%, 100% { transform: scale(1); }
+                    50% { transform: scale(1.12); }
+                }
+
+                /* Bungkus Teks di Tengah Kotak */
+                .quiz-words-wrap {
+                    flex: 1;
+                    display: flex;
+                    flex-wrap: wrap;
+                    align-items: center;
+                    justify-content: center;
+                    text-align: center;
+                    padding-right: 26px; /* Penyeimbang agar teks tetap tepat di tengah kotak */
+                }
+
+                /* Setiap Kata di Dalam Kotak (Default: Abu-abu, Terdeteksi: Biru, Ulang: Kuning) */
+                .quiz-word {
+                    display: inline-block;
+                    margin: 2px 4.5px;
+                    color: #6B7280; /* Default Abu-abu */
+                    font-size: 16.5px;
+                    font-weight: 600;
+                    transition: color 0.18s ease, transform 0.18s cubic-bezier(0.34, 1.56, 0.64, 1);
+                }
+                .quiz-word.word-blue {
+                    color: #2563EB !important; /* Berubah Biru saat suara & grammar cocok */
+                    font-weight: 700;
+                    transform: scale(1.04);
+                }
+                .quiz-word.word-yellow {
+                    color: #D97706 !important; /* Berubah Kuning saat meminta user membaca ulang */
+                    font-weight: 700;
+                }
+                .quiz-word.word-wrong {
+                    color: #EF4444 !important;
                 }
 
                 .choice-flag-icon {
@@ -1164,7 +1688,7 @@ def get_ui_injection_js() -> str:
                 }
                 body.teach-mode-active.dark-mode #tuzi-chat-send { background: #FFFFFF; color: #000000; }
 
-                /* === BOTTOM DOCK (HANYA TOMBOL HANGUP MERAH) === */
+                /* === BOTTOM DOCK === */
                 .discord-call-wrapper {
                     pointer-events: auto; display: flex; align-items: center;
                     justify-content: center; margin-bottom: 34px; margin-top: auto; z-index: 10;
@@ -1231,7 +1755,7 @@ def get_ui_injection_js() -> str:
                     </div>
                 </div>
 
-                <!-- CONTAINER BOX BUBBLE PILIHAN (DI BAWAH SUBTITLE) -->
+                <!-- CONTAINER BOX PILIHAN BAHASA, LEVEL, & KUIS GRAMMAR DUOLINGO -->
                 <div id="tuzi-choice-container"></div>
 
                 <!-- SIDEBAR KIRI -->
@@ -1293,7 +1817,6 @@ def get_ui_injection_js() -> str:
                             </svg>
                         </button>
 
-                        <!-- LIST MENU SETTINGS KE BAWAH (DEFAULT: FEMALE AKTIF) -->
                         <div id="tuzi-settings-dropdown">
                             <div class="dropdown-section-title">Swap Gender & Voice</div>
                             <div class="dropdown-gender-box">
@@ -1429,7 +1952,7 @@ def get_ui_injection_js() -> str:
                     </div>
                 </div>
 
-                <!-- BOTTOM DOCK (HANYA TOMBOL HANGUP) -->
+                <!-- BOTTOM DOCK -->
                 <div class="discord-call-wrapper">
                     <button class="hangup-btn" id="exit-teach-btn" title="Tutup Aplikasi">
                         <svg width="32" height="32" viewBox="0 0 24 24" fill="currentColor">
@@ -1443,7 +1966,7 @@ def get_ui_injection_js() -> str:
             // 1. LANGSUNG AKTIFKAN MODE BLOB & SET FEMALE SEBAGAI DEFAULT SAAT APP DIBUKA
             document.body.classList.add('teach-mode-active', 'female-avatar');
 
-            // 2. DEKLARASIKAN SEMUA ELEMEN DOM TERLEBIH DAHULU DENGAN PENGAMAN ANTI-NULL
+            // 2. DEKLARASIKAN SEMUA ELEMEN DOM
             let sidebar = document.getElementById('tuzi-sidebar');
             let burgerBtn = document.getElementById('tuzi-burger-btn');
             let closeSidebarBtn = document.getElementById('close-sidebar-btn');
@@ -1472,6 +1995,8 @@ def get_ui_injection_js() -> str:
                 choiceContainer.id = 'tuzi-choice-container';
                 overlay.appendChild(choiceContainer);
             }
+
+            let isQuizModeActive = false;
 
             let micSelect = document.getElementById('tuzi-mic-select');
             if (micSelect && AVAILABLE_MICS && AVAILABLE_MICS.length > 0) {
@@ -1503,7 +2028,7 @@ def get_ui_injection_js() -> str:
                 }
             };
 
-            // 3. SISTEM BUBBLE CHOICE BOX (PILIH BAHASA DENGAN BENDERA -> PILIH LEVEL TANPA BENDERA)
+            // 3. SISTEM BUBBLE CHOICE BOX (PILIH BAHASA -> LEVEL -> KUIS GRAMMAR DUOLINGO)
             const FLAG_SVGS = {
                 'id-ID': `<svg viewBox="0 0 30 20" width="24" height="17"><rect width="30" height="10" fill="#E70011"/><rect y="10" width="30" height="10" fill="#FFFFFF"/></svg>`,
                 'ja-JP': `<svg viewBox="0 0 30 20" width="24" height="17"><rect width="30" height="20" fill="#FFFFFF"/><circle cx="15" cy="10" r="6" fill="#BC002D"/></svg>`,
@@ -1511,6 +2036,14 @@ def get_ui_injection_js() -> str:
                 'ko-KR': `<svg viewBox="0 0 30 20" width="24" height="17"><rect width="30" height="20" fill="#FFFFFF"/><circle cx="15" cy="10" r="5" fill="#CD2E3A"/><path d="M10,10 A5,5 0 0,0 20,10 A2.5,2.5 0 0,1 15,10 A2.5,2.5 0 0,0 10,10 Z" fill="#0047A0"/></svg>`,
                 'zh-CN': `<svg viewBox="0 0 30 20" width="24" height="17"><rect width="30" height="20" fill="#DE2910"/><polygon points="6,3 7.2,6.8 11,6.8 7.9,9 9.1,12.8 6,10.5 2.9,12.8 4.1,9 1,6.8 4.8,6.8" fill="#FFDE00"/></svg>`
             };
+
+            const VOLUME_SVG = `
+                <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
+                </svg>
+            `;
 
             const LANGUAGE_CHOICES = [
                 { label: 'Indonesia', code: 'id-ID', flag: FLAG_SVGS['id-ID'] },
@@ -1530,6 +2063,7 @@ def get_ui_injection_js() -> str:
 
             function renderChoiceBoxes(items, onSelect) {
                 if (!choiceContainer) return;
+                isQuizModeActive = false;
                 choiceContainer.innerHTML = '';
                 document.body.classList.add('choices-active');
                 choiceContainer.classList.add('show');
@@ -1549,12 +2083,101 @@ def get_ui_injection_js() -> str:
             }
 
             function hideChoiceBoxes() {
+                isQuizModeActive = false;
                 if (choiceContainer) {
                     choiceContainer.classList.remove('show');
                     choiceContainer.innerHTML = '';
                 }
                 document.body.classList.remove('choices-active');
             }
+
+            // Render Kuis Pilihan Ganda Grammar & Speaking (Logo Volume di Kiri + Kata Abu-abu di Tengah)
+            window.renderGrammarQuiz = function(quizDataJson) {
+                if (!choiceContainer) return;
+                let data = typeof quizDataJson === 'string' ? JSON.parse(quizDataJson) : quizDataJson;
+                let options = data.options || [];
+                if (!options.length) return;
+
+                isQuizModeActive = true;
+                choiceContainer.innerHTML = '';
+                document.body.classList.add('choices-active');
+                choiceContainer.classList.add('show');
+
+                options.forEach((opt, optIdx) => {
+                    let box = document.createElement('div');
+                    box.className = 'tuzi-quiz-box';
+                    box.id = 'quiz-box-' + optIdx;
+                    box.style.animationDelay = (optIdx * 0.065) + 's';
+
+                    // Tombol Volume di sebelah kiri teks
+                    let volBtn = document.createElement('button');
+                    volBtn.className = 'quiz-vol-btn';
+                    volBtn.id = 'quiz-vol-' + optIdx;
+                    volBtn.title = 'Dengarkan cara pengucapan kalimat ini';
+                    volBtn.innerHTML = VOLUME_SVG;
+                    volBtn.onclick = (e) => {
+                        e.stopPropagation();
+                        volBtn.classList.add('playing');
+                        setTimeout(() => volBtn.classList.remove('playing'), 2200);
+                        if (window.pyBridge) {
+                            window.pyBridge.start_ptt('READ_OPTION:' + optIdx);
+                        }
+                    };
+                    volBtn.onmousedown = (e) => e.stopPropagation();
+
+                    // Teks kalimat di tengah kotak (tiap kata dibungkus span .quiz-word)
+                    let wordsWrap = document.createElement('div');
+                    wordsWrap.className = 'quiz-words-wrap';
+                    let words = (opt.text || '').trim().split(/\s+/);
+                    words.forEach((w, wIdx) => {
+                        let span = document.createElement('span');
+                        span.className = 'quiz-word';
+                        span.id = `quiz-word-${optIdx}-${wIdx}`;
+                        span.textContent = w;
+                        wordsWrap.appendChild(span);
+                    });
+
+                    // User juga bisa menahan langsung kotak jawaban untuk berbicara
+                    box.addEventListener('mousedown', startHold);
+
+                    box.appendChild(volBtn);
+                    box.appendChild(wordsWrap);
+                    choiceContainer.appendChild(box);
+                });
+            };
+
+            // Update Warna Kata (Abu-abu -> Biru saat terdeteksi / Kuning saat diminta ulang)
+            window.updateGrammarQuizState = function(stateJson) {
+                let st = typeof stateJson === 'string' ? JSON.parse(stateJson) : stateJson;
+                let optIdx = st.optionIndex;
+                let wordStates = st.wordStates || [];
+                let boxState = st.boxState || '';
+
+                let box = document.getElementById('quiz-box-' + optIdx);
+                if (!box) return;
+
+                box.classList.remove('state-detecting', 'state-blue', 'state-yellow', 'state-wrong');
+                if (boxState) {
+                    box.classList.add('state-' + boxState);
+                }
+
+                if (st.highlightAssist) {
+                    let volBtn = document.getElementById('quiz-vol-' + optIdx);
+                    if (volBtn) {
+                        volBtn.classList.add('playing');
+                        setTimeout(() => volBtn.classList.remove('playing'), 2600);
+                    }
+                }
+
+                wordStates.forEach((colorState, wIdx) => {
+                    let wordElem = document.getElementById(`quiz-word-${optIdx}-${wIdx}`);
+                    if (!wordElem) return;
+                    wordElem.classList.remove('word-blue', 'word-yellow', 'word-wrong');
+                    if (colorState === 'blue') wordElem.classList.add('word-blue');
+                    else if (colorState === 'yellow') wordElem.classList.add('word-yellow');
+                    else if (colorState === 'wrong') wordElem.classList.add('word-wrong');
+                });
+            };
 
             window.showLanguageOnboarding = function() {
                 renderChoiceBoxes(LANGUAGE_CHOICES, (selected) => {
@@ -1763,7 +2386,10 @@ def get_ui_injection_js() -> str:
             function startHold(e) {
                 e.preventDefault();
                 if (isHolding || document.body.classList.contains('chat-tab-open')) return;
-                hideChoiceBoxes();
+                // Jangan sembunyikan kotak jika sedang berada di mode Kuis Pilihan Ganda!
+                if (!isQuizModeActive) {
+                    hideChoiceBoxes();
+                }
                 isHolding = true;
                 if (blobWrapper) blobWrapper.classList.add('listening');
                 if (blobStage) blobStage.classList.add('listening');
@@ -1903,7 +2529,7 @@ def get_ui_injection_js() -> str:
             if (exitBtn1) exitBtn1.addEventListener('click', triggerHangup);
             if (exitBtn2) exitBtn2.addEventListener('click', triggerHangup);
 
-            // 7. TAMPILKAN BOX BAHASA & HUBUNGKAN QWEBCHANNEL DI AKHIR SETELAH SEMUA DOM SIAP
+            // 7. TAMPILKAN BOX BAHASA & HUBUNGKAN QWEBCHANNEL
             window.showLanguageOnboarding();
 
             function connectPyBridge() {
