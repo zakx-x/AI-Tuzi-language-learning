@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 import pygame
 import edge_tts
 from elevenlabs.client import ElevenLabs
-from openai import OpenAI
+from openai import OpenAI, NotFoundError, RateLimitError, InternalServerError, BadRequestError
 
 from PyQt5.QtCore import (
     QObject,
@@ -58,7 +58,57 @@ llm_client = OpenAI(
     api_key=config.OPENROUTER_API_KEY,
 )
 
-ACTIVE_MODEL = "nousresearch/hermes-3-llama-3.1-70b"
+# Model bisa diganti lewat config.py (LLM_MODEL / LLM_FALLBACK_MODELS) tanpa edit kode.
+# Hermes 3 70B sudah dihapus dari OpenRouter -> pakai penerusnya, Hermes 4 70B.
+def _valid_slug(m) -> bool:
+    """ID model OpenRouter selalu berbentuk 'vendor/nama-model'. Nama gaya Ollama ('qwen2.5:3b') tidak valid."""
+    return isinstance(m, str) and "/" in m and " " not in m
+
+
+_cfg_model = getattr(config, "LLM_MODEL", None)
+if _cfg_model and not _valid_slug(_cfg_model):
+    print(f"[LLM] PERINGATAN: LLM_MODEL di config.py ('{_cfg_model}') bukan ID model OpenRouter "
+          f"(contoh: nousresearch/hermes-4-70b). Nilai itu diabaikan.")
+    _cfg_model = None
+
+ACTIVE_MODEL = _cfg_model or "nousresearch/hermes-4-70b"
+FALLBACK_MODELS = [m for m in getattr(config, "LLM_FALLBACK_MODELS", ["nousresearch/hermes-4-405b"]) if _valid_slug(m)]
+print(f"[LLM] Model aktif: {ACTIVE_MODEL}")
+
+
+def llm_complete(messages, **kwargs):
+    """Panggil OpenRouter; kalau model dihapus (404) / kena rate-limit / server error, coba model cadangan."""
+    global ACTIVE_MODEL
+    chain = [ACTIVE_MODEL] + [m for m in FALLBACK_MODELS if m != ACTIVE_MODEL]
+    dead = set()
+    last_err = None
+    for model in chain:
+        try:
+            resp = llm_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                extra_body={"reasoning": {"enabled": False}},  # Hermes 4 = hybrid reasoning; matikan untuk chat cepat
+                **kwargs,
+            )
+            if ACTIVE_MODEL in dead:
+                print(f"[LLM] Model aktif dialihkan ke: {model}")
+                ACTIVE_MODEL = model
+            return resp
+        except NotFoundError as e:
+            print(f"[LLM] Model '{model}' sudah tidak tersedia di OpenRouter, mencoba cadangan...")
+            dead.add(model)
+            last_err = e
+        except BadRequestError as e:
+            if "model" in str(e).lower():
+                print(f"[LLM] Model '{model}' ditolak OpenRouter (ID tidak valid), mencoba cadangan...")
+                dead.add(model)
+                last_err = e
+            else:
+                raise
+        except (RateLimitError, InternalServerError) as e:
+            print(f"[LLM] Model '{model}' sedang sibuk/error ({type(e).__name__}), mencoba cadangan...")
+            last_err = e
+    raise last_err
 
 
 def _presence_context() -> dict:
@@ -757,7 +807,12 @@ def chat_processor_loop(bridge, tts_engine):
 
             # 5. Pencarian Internet (Jika diperlukan)
             if ai_tools:
-                tool_context = ai_tools.get_tools_context(user_input)
+                try:
+                    tool_context = ai_tools.get_tools_context(user_input)
+                except Exception as e:
+                    # Kegagalan pencarian internet tidak boleh menggagalkan seluruh balasan Tuzi
+                    print(f"[ai_tools] Pencarian internet gagal, lanjut tanpa data internet -> {type(e).__name__}: {e}")
+                    tool_context = ""
                 if tool_context:
                     user_input += f"\n\n{tool_context}"
 
@@ -765,13 +820,13 @@ def chat_processor_loop(bridge, tts_engine):
             if len(chat_history) > 11:
                 chat_history = [chat_history[0]] + chat_history[-10:]
 
-            response = llm_client.chat.completions.create(
-                model=ACTIVE_MODEL,
-                messages=chat_history,
+            response = llm_complete(
+                chat_history,
                 temperature=0.72,
                 max_tokens=320
             )
-            raw_output = response.choices[0].message.content.strip()
+            raw_output = (response.choices[0].message.content or "").strip()
+            raw_output = re.sub(r"<think>.*?</think>", "", raw_output, flags=re.S).strip()  # jaga-jaga
 
             chat_history.append({"role": "assistant", "content": raw_output})
             save_memory(chat_history)
