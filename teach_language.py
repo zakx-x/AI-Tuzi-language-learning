@@ -1,3 +1,5 @@
+import collections
+import copy
 import io
 import json
 import os
@@ -5,8 +7,13 @@ import re
 import difflib
 import random
 import threading
+import time
+import warnings
 import wave
 import audioop
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 import pygame
 import speech_recognition as sr
 from PyQt5.QtCore import Qt, QPoint, QFile, QIODevice
@@ -48,9 +55,25 @@ main_input_queue = None
 main_window_ref = None
 bridge_ref = None            # Diisi oleh run_tuzi.py untuk update warna kata real-time
 
-# Menyimpan state kuis pilihan ganda yang sedang aktif di layar
+# Menyimpan state kuis pilihan ganda yang sedang aktif di layar & antrean pre-fetch (quiz_buffer)
+QUIZ_BATCH_SIZE = 6
+QUIZ_REFILL_THRESHOLD = 2
+ROMANIZED_LANGS = {"ja-JP", "ko-KR", "zh-CN"}
+
 active_quiz = None
 quiz_turn_counter = 0
+quiz_buffer = collections.deque()            # Thread-safe batch pre-fetching queue (dikunci oleh quiz_buffer_lock)
+quiz_buffer_lock = threading.RLock()
+quiz_ready_event = threading.Event()
+quiz_generator_fn = None                     # Diisi oleh run_tuzi.py (QUIZ_GEN_MODEL JSON mode)
+_quiz_epoch = 0                              # Naik tiap bahasa/level/Personal Intelligence berubah
+_inflight_epoch = None
+_buffer_config = None                        # Tuple (target_lang, user_level, custom_personality)
+_pending_first_emit_bridge = None            # Jika diset, producer langsung pop & emit soal pertama (0 ms delay)
+_recent_questions = collections.deque(maxlen=30)
+
+# Event interupsi instan untuk menghentikan streaming suara TTS kapan saja
+voice_interrupt_event = threading.Event()
 
 LANGUAGE_NAMES = {
     "id-ID": "Indonesian (Bahasa Indonesia)",
@@ -214,9 +237,22 @@ DEFAULT_WIN_WIDTH = 600
 DEFAULT_WIN_HEIGHT = 1300
 
 
+_NATIVE_SCRIPT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
+_THINK_TAG_RE = re.compile(r"<think>.*?</think>", flags=re.IGNORECASE | re.DOTALL)
+
+
+# ==============================================================================
+# LAYER A: HEADLESS QUIZ & EVALUATION ENGINE (Pure Python — Capacitor-Ready)
+# Tidak menyentuh DOM/HTML/CSS/JS atau widget PyQt secara langsung; seluruh output
+# berupa struktur dict/JSON murni agar frontend bisa diekstrak ke Android APK.
+# ==============================================================================
 def normalize_word(w: str) -> str:
     """Membersihkan tanda baca dan mengubah kata menjadi huruf kecil untuk pencocokan."""
     return re.sub(r"[^\w\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]", "", w.lower()).strip()
+
+
+def _normalize_sentence(text: str) -> str:
+    return " ".join(tok for tok in (normalize_word(w) for w in (text or "").split()) if tok)
 
 
 def match_spoken_to_option(spoken_text: str, option_obj: dict) -> tuple[list[bool], float]:
@@ -248,7 +284,6 @@ def match_spoken_to_option(spoken_text: str, option_obj: dict) -> tuple[list[boo
         for j, spoken_w in enumerate(spoken_tokens):
             if j in used_spoken_indices:
                 continue
-            # Cocok persis atau kemiripan fonetik >= 0.76
             sim = difflib.SequenceMatcher(None, target_w, spoken_w).ratio()
             if target_w == spoken_w or sim >= 0.76 or (len(target_w) >= 4 and target_w in spoken_w):
                 matched_flags[i] = True
@@ -260,10 +295,7 @@ def match_spoken_to_option(spoken_text: str, option_obj: dict) -> tuple[list[boo
     # 2. Pencocokan karakter Native (Jika STT menghasilkan huruf Jepang/Korea/Mandarin asli)
     native_clean = normalize_word(native_text)
     if native_clean and word_match_ratio < 0.35:
-        matched_chars = 0
-        for ch in native_clean:
-            if ch in spoken_clean:
-                matched_chars += 1
+        matched_chars = sum(1 for ch in native_clean if ch in spoken_clean)
         char_ratio = matched_chars / max(1, len(native_clean))
         if char_ratio > word_match_ratio:
             num_words_matched = int(round(char_ratio * len(display_words)))
@@ -273,67 +305,12 @@ def match_spoken_to_option(spoken_text: str, option_obj: dict) -> tuple[list[boo
     return matched_flags, word_match_ratio
 
 
-def build_quiz_from_llm_or_fallback(raw_llm_output: str) -> dict:
-    """Mengekstrak [QUIZ_DATA: {...}] dari output LLM atau menggunakan kuis cadangan jika gagal."""
-    global active_quiz, quiz_turn_counter
+def compute_partial_quiz_state(quiz_obj: dict, partial_spoken: str):
+    """Menghitung payload JSON warna kata real-time (abu-abu -> biru) tanpa menyentuh UI."""
+    if not quiz_obj or not (partial_spoken or "").strip():
+        return None
 
-    quiz_match = re.search(r"\[QUIZ_DATA:\s*(\{.*?\})\s*\]", raw_llm_output, flags=re.IGNORECASE | re.DOTALL)
-    parsed_options = []
-
-    if quiz_match:
-        try:
-            data = json.loads(quiz_match.group(1))
-            if "options" in data and isinstance(data["options"], list):
-                for opt in data["options"]:
-                    if isinstance(opt, dict) and opt.get("text"):
-                        parsed_options.append({
-                            "text": str(opt["text"]).strip(),
-                            "native": str(opt.get("native", opt["text"])).strip(),
-                            "is_correct": bool(opt.get("is_correct", False)),
-                        })
-            elif "correct" in data:
-                parsed_options = [
-                    {
-                        "text": str(data["correct"]).strip(),
-                        "native": str(data.get("correct_native", data["correct"])).strip(),
-                        "is_correct": True,
-                    },
-                    {
-                        "text": str(data.get("wrong1", "")).strip(),
-                        "native": str(data.get("wrong1_native", data.get("wrong1", ""))).strip(),
-                        "is_correct": False,
-                    },
-                    {
-                        "text": str(data.get("wrong2", "")).strip(),
-                        "native": str(data.get("wrong2_native", data.get("wrong2", ""))).strip(),
-                        "is_correct": False,
-                    },
-                ]
-                parsed_options = [o for o in parsed_options if o["text"]]
-        except Exception as e:
-            print(f"[Quiz Parser Warning] Gagal parse JSON kuis dari LLM: {e}")
-
-    # Jika LLM tidak menyertakan minimal 2 opsi valid, gunakan bank kuis sesuai bahasa
-    if len(parsed_options) < 2 or not any(o["is_correct"] for o in parsed_options):
-        bank = FALLBACK_QUIZ_BANK.get(target_lang, FALLBACK_QUIZ_BANK["en-US"])
-        item = bank[quiz_turn_counter % len(bank)]
-        quiz_turn_counter += 1
-        parsed_options = [dict(o) for o in item["options"]]
-
-    random.shuffle(parsed_options)
-    active_quiz = {"options": parsed_options}
-    return active_quiz
-
-
-def update_live_partial_quiz_ui(partial_spoken: str):
-    """
-    Mengubah warna kata dari Abu-abu menjadi Biru secara real-time (gaya Duolingo)
-    saat user sedang berbicara di mikrofon.
-    """
-    if not active_quiz or not bridge_ref or not partial_spoken.strip():
-        return
-
-    options = active_quiz.get("options", [])
+    options = quiz_obj.get("options", [])
     best_idx = -1
     best_ratio = 0.0
     best_flags = []
@@ -346,45 +323,42 @@ def update_live_partial_quiz_ui(partial_spoken: str):
             best_flags = flags
 
     if best_idx >= 0 and best_ratio > 0.0:
-        word_states = ["blue" if m else "grey" for m in best_flags]
-        payload = {
+        return {
             "optionIndex": best_idx,
-            "wordStates": word_states,
+            "wordStates": ["blue" if m else "grey" for m in best_flags],
             "boxState": "detecting",
         }
-        bridge_ref.quiz_state_signal.emit(json.dumps(payload))
+    return None
 
 
-def evaluate_quiz_attempt(spoken_text: str, bridge) -> tuple[str, str, str]:
+def compute_quiz_evaluation(quiz_obj: dict, spoken_text: str) -> dict:
     """
-    Mengevaluasi bacaan user setelah melepas tombol mikrofon:
-    - 'PASS': Semua kata pada jawaban yang benar terdeteksi (>= 82%) -> Biru semua!
-    - 'PARTIAL': Baru sebagian kata jawaban benar yang terdeteksi (misal 'saya berasal' dari 'saya berasal dari korea') -> Kata sisa jadi Kuning & minta ulang!
-    - 'UNCLEAR': Suara tidak tertangkap sama sekali -> Teks jawaban jadi Kuning & minta ulang!
-    - 'WRONG_GRAMMAR': User membaca opsi yang grammar-nya salah atau salah ucap -> AI membacakan jawaban yang benar untuk diikuti!
+    Mengevaluasi bacaan user secara murni (tanpa dependensi PyQt/DOM) dan mengembalikan:
+      {"status": str, "feedback_text": str, "spoken_assist": str, "state_updates": list[dict]}
     """
-    global active_quiz
-    if not active_quiz:
-        return "NONE", "", ""
+    if not quiz_obj or not quiz_obj.get("options"):
+        return {"status": "NONE", "feedback_text": "", "spoken_assist": "", "state_updates": []}
 
-    options = active_quiz.get("options", [])
+    options = quiz_obj.get("options", [])
     correct_idx = next((i for i, o in enumerate(options) if o.get("is_correct")), 0)
     correct_opt = options[correct_idx]
     correct_text = correct_opt["text"]
     correct_words = [w for w in correct_text.split() if w.strip()]
 
-    # 1. Jika suara kosong / tidak tertangkap sama sekali -> Warna Kuning (Minta baca ulang)
+    # 1. Suara kosong / tidak tertangkap -> Kuning (Minta baca ulang)
     if not spoken_text or not spoken_text.strip():
-        payload = {
-            "optionIndex": correct_idx,
-            "wordStates": ["yellow"] * len(correct_words),
-            "boxState": "yellow",
-        }
-        bridge.quiz_state_signal.emit(json.dumps(payload))
         msg = "Suaramu belum terdengar jelas. Coba baca kembali kalimat yang berwarna kuning ya!"
-        return "UNCLEAR", msg, msg
+        return {
+            "status": "UNCLEAR",
+            "feedback_text": msg,
+            "spoken_assist": msg,
+            "state_updates": [{
+                "optionIndex": correct_idx,
+                "wordStates": ["yellow"] * len(correct_words),
+                "boxState": "yellow",
+            }],
+        }
 
-    # Hitung kecocokan terhadap opsi yang benar dan opsi pengecoh
     corr_flags, corr_ratio = match_spoken_to_option(spoken_text, correct_opt)
 
     best_wrong_idx = -1
@@ -397,60 +371,496 @@ def evaluate_quiz_attempt(spoken_text: str, bridge) -> tuple[str, str, str]:
             best_wrong_ratio = w_ratio
             best_wrong_idx = idx
 
-    # 2. Jika user membaca opsi dengan GRAMMAR SALAH (kecocokan ke opsi salah tinggi)
+    # 2. User membaca opsi dengan GRAMMAR SALAH -> Opsi salah merah, jawaban benar kuning + dibacakan AI
     if best_wrong_ratio >= 0.65 and best_wrong_ratio > corr_ratio + 0.15:
         wrong_words = options[best_wrong_idx]["text"].split()
-        bridge.quiz_state_signal.emit(json.dumps({
-            "optionIndex": best_wrong_idx,
-            "wordStates": ["wrong"] * len(wrong_words),
-            "boxState": "wrong",
-        }))
-        # Tandai jawaban yang benar dengan warna kuning & minta AI membacakannya
-        bridge.quiz_state_signal.emit(json.dumps({
-            "optionIndex": correct_idx,
-            "wordStates": ["yellow"] * len(correct_words),
-            "boxState": "yellow",
-            "highlightAssist": True,
-        }))
         assist_msg = f"Pilihan itu grammar-nya kurang tepat. Ikuti cara bacaku ya: {correct_text}"
-        return "WRONG_GRAMMAR", assist_msg, assist_msg
+        return {
+            "status": "WRONG_GRAMMAR",
+            "feedback_text": assist_msg,
+            "spoken_assist": assist_msg,
+            "state_updates": [
+                {
+                    "optionIndex": best_wrong_idx,
+                    "wordStates": ["wrong"] * len(wrong_words),
+                    "boxState": "wrong",
+                },
+                {
+                    "optionIndex": correct_idx,
+                    "wordStates": ["yellow"] * len(correct_words),
+                    "boxState": "yellow",
+                    "highlightAssist": True,
+                },
+            ],
+        }
 
-    # 3. Jika SEMUA kata (atau >= 82% kata) pada jawaban yang benar terdeteksi -> 100% BIRU (LULUS!)
+    # 3. >= 82% kata jawaban benar terdeteksi -> 100% BIRU (PASS!)
     if corr_ratio >= 0.82 or all(corr_flags):
-        bridge.quiz_state_signal.emit(json.dumps({
-            "optionIndex": correct_idx,
-            "wordStates": ["blue"] * len(correct_words),
-            "boxState": "blue",
-        }))
-        return "PASS", correct_text, ""
+        return {
+            "status": "PASS",
+            "feedback_text": correct_text,
+            "spoken_assist": "",
+            "state_updates": [{
+                "optionIndex": correct_idx,
+                "wordStates": ["blue"] * len(correct_words),
+                "boxState": "blue",
+            }],
+        }
 
-    # 4. Jika HANYA SEBAGIAN kata yang terdeteksi (misal: 'saya berasal' dari 'saya berasal dari korea')
-    # Kata yang terdeteksi jadi BIRU, sisa kata yang belum terbaca jadi KUNING!
+    # 4. Sebagian kata terdeteksi -> kata terbaca BIRU, sisanya KUNING
     if sum(1 for f in corr_flags if f) >= 1:
         word_states = ["blue" if f else "yellow" for f in corr_flags]
-        detected_words_str = " ".join(
-            w for w, f in zip(correct_words, corr_flags) if f
-        )
-        bridge.quiz_state_signal.emit(json.dumps({
-            "optionIndex": correct_idx,
-            "wordStates": word_states,
-            "boxState": "yellow",
-        }))
+        detected_words_str = " ".join(w for w, f in zip(correct_words, corr_flags) if f)
         retry_msg = (
             f"Baru terdengar '{detected_words_str}'. "
             f"Coba baca ulang kalimat lengkapnya yang berwarna kuning ya!"
         )
-        return "PARTIAL", retry_msg, retry_msg
+        return {
+            "status": "PARTIAL",
+            "feedback_text": retry_msg,
+            "spoken_assist": retry_msg,
+            "state_updates": [{
+                "optionIndex": correct_idx,
+                "wordStates": word_states,
+                "boxState": "yellow",
+            }],
+        }
 
-    # 5. Jika user salah mengucapkan kata-katanya sama sekali -> AI memberi bantuan membacakannya!
-    bridge.quiz_state_signal.emit(json.dumps({
-        "optionIndex": correct_idx,
-        "wordStates": ["yellow"] * len(correct_words),
-        "boxState": "yellow",
-        "highlightAssist": True,
-    }))
+    # 5. Salah ucap total -> AI membantu membacakan
     assist_msg = f"Pelafalannya belum pas. Dengarkan dan ikuti cara bacaku ya: {correct_text}"
-    return "MISPRONOUNCED", assist_msg, assist_msg
+    return {
+        "status": "MISPRONOUNCED",
+        "feedback_text": assist_msg,
+        "spoken_assist": assist_msg,
+        "state_updates": [{
+            "optionIndex": correct_idx,
+            "wordStates": ["yellow"] * len(correct_words),
+            "boxState": "yellow",
+            "highlightAssist": True,
+        }],
+    }
+
+
+def build_quiz_batch_messages(
+    lang_code: str,
+    level_name: str,
+    persona_text: str = "",
+    avoid_questions: list = None,
+    batch_size: int = QUIZ_BATCH_SIZE,
+) -> list:
+    """Menyusun prompt JSON terstruktur untuk meminta 6 soal sekaligus ke QUIZ_GEN_MODEL."""
+    lang_label = LANGUAGE_NAMES.get(lang_code, lang_code)
+    level_guide = LEVEL_PEDAGOGY.get(level_name, LEVEL_PEDAGOGY["Beginner"])
+
+    if lang_code in ROMANIZED_LANGS:
+        script_rule = (
+            'For "text", use ONLY space-separated Romanized words (Hepburn Romaji for ja-JP, '
+            'Revised Romanization for ko-KR, clean Pinyin without tone marks for zh-CN) so learners '
+            'can read word-by-word. Put the authentic native script (Kanji/Kana, Hangul, Simplified Hanzi) '
+            'in "native". "text" and "native" MUST represent the exact same words.'
+        )
+    else:
+        script_rule = (
+            'For both "text" and "native", write standard space-separated words in the target language.'
+        )
+
+    persona_hint = ""
+    if persona_text and persona_text.strip():
+        persona_hint = (
+            f'- Adapt situational themes/vocabulary subtly to this learner preference (keep strict JSON schema): '
+            f'"{persona_text.strip()[:320]}"\n'
+        )
+
+    avoid_list = [q for q in (avoid_questions or []) if q][-12:]
+    avoid_hint = ""
+    if avoid_list:
+        avoid_hint = f"- Do NOT repeat or closely paraphrase these recent questions: {json.dumps(avoid_list, ensure_ascii=False)}\n"
+
+    system_msg = (
+        f"You are an expert native-level {lang_label} linguist and Duolingo speaking/grammar curriculum designer. "
+        "Output strictly ONE valid JSON object matching the requested schema, with zero markdown or prose."
+    )
+    user_msg = (
+        f"Generate a batch of exactly {batch_size} multiple-choice speaking & grammar questions for Zak (Indonesian speaker).\n"
+        f"TARGET LANGUAGE: {lang_label} ({lang_code})\n"
+        f"PROFICIENCY: {level_name} — {level_guide}\n"
+        "STRICT REQUIREMENTS:\n"
+        '1. Each item in "quizzes" MUST follow:\n'
+        '   {"question": "...", "options": ['
+        '{"text": "...", "native": "...", "is_correct": true}, '
+        '{"text": "...", "native": "...", "is_correct": false}, '
+        '{"text": "...", "native": "...", "is_correct": false}]}\n'
+        '2. "question" MUST be written in clear Bahasa Indonesia (under 18 words) stating the exact meaning/situation '
+        "so that ONLY the 1 correct option is accurate.\n"
+        '3. Exactly 1 option has "is_correct": true (100% natural, grammatically correct native sentence).\n'
+        '4. Exactly 2 options have "is_correct": false (plausible distractors reusing similar vocabulary, each containing '
+        "a genuine learner grammar error such as wrong particle/preposition, wrong verb conjugation/tense, wrong word order, "
+        "or wrong classifier — never valid alternative phrasings).\n"
+        f"5. {script_rule}\n"
+        "6. Cover diverse, practical everyday situations across the 6 questions. Do not number options or add emojis.\n"
+        f"{persona_hint}{avoid_hint}"
+        'Return JSON in exact root format: {"quizzes": [ ... ]}'
+    )
+    return [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_msg},
+    ]
+
+
+def _coerce_bool(val) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return val == 1
+    return str(val).strip().lower() in ("true", "1", "yes", "correct")
+
+
+def validate_quiz_item(raw_item: dict, lang_code: str):
+    """Memvalidasi & menormalkan 1 objek kuis agar sesuai skema ketat (1 benar + 2 pengecoh)."""
+    if not isinstance(raw_item, dict):
+        return None
+    question = re.sub(r"\s+", " ", str(raw_item.get("question") or "")).strip()
+    raw_options = raw_item.get("options")
+    if not question or not isinstance(raw_options, list):
+        return None
+
+    correct_opts = []
+    wrong_opts = []
+    seen_texts = set()
+
+    for opt in raw_options:
+        if not isinstance(opt, dict):
+            continue
+        text = re.sub(r"\s+", " ", str(opt.get("text") or "")).strip()
+        native = re.sub(r"\s+", " ", str(opt.get("native") or text)).strip() or text
+
+        if lang_code in ROMANIZED_LANGS:
+            if _NATIVE_SCRIPT_RE.search(text) and not _NATIVE_SCRIPT_RE.search(native):
+                text, native = native, text
+            if _NATIVE_SCRIPT_RE.search(text):
+                continue
+
+        if not text or len(text.split()) < 1 or len(text.split()) > 22:
+            continue
+
+        norm_key = _normalize_sentence(text)
+        if not norm_key or norm_key in seen_texts:
+            continue
+        seen_texts.add(norm_key)
+
+        cleaned_opt = {
+            "text": text,
+            "native": native,
+            "is_correct": _coerce_bool(opt.get("is_correct", False)),
+        }
+        if cleaned_opt["is_correct"]:
+            correct_opts.append(cleaned_opt)
+        else:
+            wrong_opts.append(cleaned_opt)
+
+    if len(correct_opts) != 1 or len(wrong_opts) < 2:
+        return None
+
+    final_options = [correct_opts[0], wrong_opts[0], wrong_opts[1]]
+    random.shuffle(final_options)
+    return {"question": question, "options": final_options}
+
+
+def parse_quiz_batch_response(raw_output: str, lang_code: str) -> list:
+    """Mengurai respons JSON batch dari QUIZ_GEN_MODEL menjadi daftar kuis tervalidasi."""
+    if not raw_output:
+        return []
+    cleaned = _THINK_TAG_RE.sub("", str(raw_output)).strip()
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE).strip()
+
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start_i, end_i = cleaned.find("{"), cleaned.rfind("}")
+        if start_i == -1 or end_i <= start_i:
+            return []
+        try:
+            data = json.loads(cleaned[start_i:end_i + 1])
+        except Exception:
+            return []
+
+    if isinstance(data, dict):
+        items = data.get("quizzes") or data.get("questions") or data.get("items")
+        if items is None and "options" in data:
+            items = [data]
+    elif isinstance(data, list):
+        items = data
+    else:
+        items = []
+
+    if not isinstance(items, list):
+        return []
+
+    valid_quizzes = []
+    seen_q = set()
+    for item in items:
+        validated = validate_quiz_item(item, lang_code)
+        if not validated:
+            continue
+        q_key = _normalize_sentence(validated["question"])
+        if q_key in seen_q:
+            continue
+        seen_q.add(q_key)
+        valid_quizzes.append(validated)
+    return valid_quizzes
+
+
+def get_fallback_quiz(lang_code: str = None) -> dict:
+    """Mengambil 1 soal cadangan dari FALLBACK_QUIZ_BANK jika offline atau API gagal."""
+    global quiz_turn_counter
+    code = lang_code or target_lang
+    bank = FALLBACK_QUIZ_BANK.get(code, FALLBACK_QUIZ_BANK["en-US"])
+    item = copy.deepcopy(bank[quiz_turn_counter % len(bank)])
+    quiz_turn_counter += 1
+    random.shuffle(item["options"])
+    return item
+
+
+def get_fallback_quiz_batch(lang_code: str = None, count: int = QUIZ_BATCH_SIZE) -> list:
+    code = lang_code or target_lang
+    return [get_fallback_quiz(code) for _ in range(max(1, count))]
+
+
+# ==============================================================================
+# LAYER B: THREAD-SAFE QUIZ BUFFER PRODUCER & DESKTOP BRIDGE ADAPTER
+# ==============================================================================
+def emit_quiz_options(bridge, quiz_obj: dict):
+    """Mengirim payload kuis bersih ke frontend via signal JSON."""
+    target_bridge = bridge or bridge_ref
+    if not target_bridge or not quiz_obj:
+        return
+    payload = {
+        "question": quiz_obj.get("question", ""),
+        "options": quiz_obj.get("options", []),
+    }
+    target_bridge.quiz_options_signal.emit(json.dumps(payload, ensure_ascii=False))
+
+
+def _quiz_producer_worker(epoch: int, lang_code: str, level_name: str, persona_text: str, avoid_snapshot: list):
+    """Background producer thread: memanggil QUIZ_GEN_MODEL untuk mengisi quiz_buffer (6 soal)."""
+    global active_quiz, _inflight_epoch, _pending_first_emit_bridge
+    t0 = time.perf_counter()
+    fetched = []
+    source = "QUIZ_GEN_MODEL"
+
+    if callable(quiz_generator_fn):
+        try:
+            messages = build_quiz_batch_messages(
+                lang_code=lang_code,
+                level_name=level_name,
+                persona_text=persona_text,
+                avoid_questions=avoid_snapshot,
+                batch_size=QUIZ_BATCH_SIZE,
+            )
+            raw_json = quiz_generator_fn(messages)
+            fetched = parse_quiz_batch_response(raw_json, lang_code)
+        except Exception as e:
+            print(f"[QuizBuffer Warning] Gagal pre-fetch dari QUIZ_GEN_MODEL: {type(e).__name__}: {e}")
+
+    avoid_norms = {_normalize_sentence(q) for q in avoid_snapshot if q}
+    filtered = [q for q in fetched if _normalize_sentence(q["question"]) not in avoid_norms]
+    if filtered:
+        fetched = filtered
+
+    immediate_bridge = None
+    immediate_quiz = None
+
+    with quiz_buffer_lock:
+        if epoch != _quiz_epoch:
+            return
+        if not fetched:
+            fetched = get_fallback_quiz_batch(lang_code, count=QUIZ_BATCH_SIZE)
+            source = "FALLBACK_QUIZ_BANK"
+        _inflight_epoch = None
+        quiz_buffer.extend(fetched)
+
+        # Jika UI sedang menunggu soal pertama (ONBOARD:LEVEL), langsung pop & emit (0 ms delay!)
+        if _pending_first_emit_bridge is not None and active_quiz is None and quiz_buffer:
+            immediate_bridge = _pending_first_emit_bridge
+            _pending_first_emit_bridge = None
+            immediate_quiz = quiz_buffer.popleft()
+            active_quiz = immediate_quiz
+            _recent_questions.append(immediate_quiz.get("question", ""))
+
+        buf_len = len(quiz_buffer)
+        quiz_ready_event.set()
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    print(f"[QuizBuffer] +{len(fetched)} soal ({source} | {lang_code}/{level_name}) siap dalam {elapsed_ms:.0f} ms (buffer={buf_len}).")
+
+    if immediate_bridge is not None and immediate_quiz is not None:
+        if ui_submode != "chat":
+            emit_quiz_options(immediate_bridge, immediate_quiz)
+
+
+def refill_quiz_buffer_async(
+    lang_code: str = None,
+    level_name: str = None,
+    persona_text: str = None,
+    clear_first: bool = False,
+) -> bool:
+    """
+    Memicu background producer thread untuk mengisi ulang quiz_buffer sebanyak 6 soal.
+    Jika clear_first=True atau konfigurasi (bahasa/level/Personal Intelligence) berubah,
+    quiz_buffer dikosongkan terlebih dahulu.
+    """
+    global _quiz_epoch, _inflight_epoch, _buffer_config, _pending_first_emit_bridge
+    lang_val = lang_code if lang_code is not None else target_lang
+    lvl_val = level_name if level_name is not None else user_level
+    pers_val = persona_text if persona_text is not None else custom_personality
+    cfg = (lang_val, lvl_val, pers_val or "")
+
+    with quiz_buffer_lock:
+        config_changed = (_buffer_config != cfg)
+        if clear_first or config_changed:
+            _quiz_epoch += 1
+            quiz_buffer.clear()
+            quiz_ready_event.clear()
+            _inflight_epoch = None
+            _pending_first_emit_bridge = None
+            _buffer_config = cfg
+
+        if _inflight_epoch == _quiz_epoch:
+            return False
+
+        _inflight_epoch = _quiz_epoch
+        epoch_snapshot = _quiz_epoch
+        avoid_snapshot = list(_recent_questions) + [q.get("question", "") for q in quiz_buffer]
+        if active_quiz and active_quiz.get("question"):
+            avoid_snapshot.append(active_quiz["question"])
+
+    worker = threading.Thread(
+        target=_quiz_producer_worker,
+        args=(epoch_snapshot, lang_val, lvl_val, pers_val or "", avoid_snapshot),
+        daemon=True,
+        name="tuzi-quiz-prefetch",
+    )
+    worker.start()
+    return True
+
+
+def ensure_quiz_batch_for_config(lang_code: str, level_name: str, persona_text: str = ""):
+    """
+    Dipanggil saat ONBOARD:LEVEL / perubahan konfigurasi:
+    - Jika batch untuk (lang, level, persona) yang persis sama sudah ada di quiz_buffer atau sedang
+      di-generate (misal hasil pre-fetch saat pilih bahasa), langsung gunakan tanpa membuangnya.
+    - Jika berbeda atau kosong, bersihkan quiz_buffer dan mulai batch 6 soal baru.
+    """
+    global active_quiz
+    cfg = (lang_code, level_name, persona_text or "")
+    with quiz_buffer_lock:
+        active_quiz = None
+        if _buffer_config == cfg and (len(quiz_buffer) > 0 or _inflight_epoch == _quiz_epoch):
+            if len(quiz_buffer) > 0:
+                quiz_ready_event.set()
+            return
+    refill_quiz_buffer_async(lang_code, level_name, persona_text, clear_first=True)
+
+
+def activate_first_quiz_when_ready(bridge, timeout: float = 4.5) -> dict:
+    """
+    Mengambil soal pertama untuk sesi baru:
+    - Jika quiz_buffer sudah berisi soal -> pop & emit dalam 0 ms!
+    - Jika producer masih berjalan -> pasang callback agar producer langsung emit begitu selesai (0 ms),
+      dan tunggu hingga timeout sebelum jatuh ke FALLBACK_QUIZ_BANK.
+    """
+    global active_quiz, _pending_first_emit_bridge
+    immediate = None
+    with quiz_buffer_lock:
+        if active_quiz is not None:
+            immediate = active_quiz
+        elif quiz_buffer:
+            immediate = quiz_buffer.popleft()
+            active_quiz = immediate
+            _recent_questions.append(immediate.get("question", ""))
+        else:
+            _pending_first_emit_bridge = bridge
+
+    if immediate is not None:
+        if ui_submode != "chat":
+            emit_quiz_options(bridge, immediate)
+        _check_and_trigger_refill()
+        return immediate
+
+    quiz_ready_event.wait(timeout=timeout)
+
+    fallback_used = False
+    with quiz_buffer_lock:
+        _pending_first_emit_bridge = None
+        if active_quiz is not None:
+            quiz_obj = active_quiz
+        elif quiz_buffer:
+            quiz_obj = quiz_buffer.popleft()
+            active_quiz = quiz_obj
+            _recent_questions.append(quiz_obj.get("question", ""))
+            fallback_used = True  # Perlu di-emit di bawah karena belum sempat di-emit producer
+        else:
+            quiz_obj = get_fallback_quiz(target_lang)
+            active_quiz = quiz_obj
+            _recent_questions.append(quiz_obj.get("question", ""))
+            fallback_used = True
+
+    if fallback_used and ui_submode != "chat":
+        emit_quiz_options(bridge, quiz_obj)
+    _check_and_trigger_refill()
+    return quiz_obj
+
+
+def _check_and_trigger_refill():
+    with quiz_buffer_lock:
+        should_refill = len(quiz_buffer) <= QUIZ_REFILL_THRESHOLD
+        cfg = _buffer_config or (target_lang, user_level, custom_personality)
+    if should_refill:
+        refill_quiz_buffer_async(cfg[0], cfg[1], cfg[2], clear_first=False)
+
+
+def pop_next_quiz_and_emit(bridge) -> dict:
+    """
+    Dipanggil instan saat status == 'PASS':
+    Langsung pop soal berikutnya dari quiz_buffer (0 ms, tanpa menunggu panggilan LLM),
+    emit quiz_options_signal ke UI, dan otomatis refill di background bila len(quiz_buffer) <= 2.
+    """
+    global active_quiz
+    with quiz_buffer_lock:
+        if quiz_buffer:
+            next_quiz = quiz_buffer.popleft()
+        else:
+            next_quiz = get_fallback_quiz(target_lang)
+        active_quiz = next_quiz
+        _recent_questions.append(next_quiz.get("question", ""))
+
+    if ui_submode != "chat":
+        emit_quiz_options(bridge, next_quiz)
+    _check_and_trigger_refill()
+    return next_quiz
+
+
+def build_quiz_from_llm_or_fallback(raw_llm_output: str = "") -> dict:
+    """Kompatibilitas mundur: mengambil soal dari quiz_buffer / fallback."""
+    return pop_next_quiz_and_emit(bridge_ref)
+
+
+def update_live_partial_quiz_ui(partial_spoken: str):
+    """Mengubah warna kata dari Abu-abu menjadi Biru secara real-time saat user berbicara."""
+    if not active_quiz or not bridge_ref or not partial_spoken.strip():
+        return
+    payload = compute_partial_quiz_state(active_quiz, partial_spoken)
+    if payload is not None:
+        bridge_ref.quiz_state_signal.emit(json.dumps(payload))
+
+
+def evaluate_quiz_attempt(spoken_text: str, bridge) -> tuple[str, str, str]:
+    """Adapter evaluasi kuis: menjalankan evaluasi murni lalu mengirim state warna ke bridge UI."""
+    eval_res = compute_quiz_evaluation(active_quiz, spoken_text)
+    if bridge is not None:
+        for st in eval_res["state_updates"]:
+            bridge.quiz_state_signal.emit(json.dumps(st))
+    return eval_res["status"], eval_res["feedback_text"], eval_res["spoken_assist"]
 
 
 def get_available_microphones() -> list:
@@ -508,10 +918,13 @@ def clean_voice_audio(raw_pcm: bytes, sample_rate: int = 16000) -> bytes:
 
 
 def stop_all_voice_playback():
-    """Menghentikan suara Tuzi secara instan."""
+    """Menghentikan suara Tuzi secara instan (baik stream Channel maupun musik MP3)."""
+    voice_interrupt_event.set()
     try:
-        if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
-            pygame.mixer.music.stop()
+        if pygame.mixer.get_init():
+            if pygame.mixer.music.get_busy():
+                pygame.mixer.music.stop()
+            pygame.mixer.stop()
     except Exception:
         pass
 
@@ -612,7 +1025,10 @@ class HoldToTalkRecorder:
 
         # 4. Perintah Onboarding: Sapaan Awal -> Pilih Bahasa -> Pilih Level
         if payload == "ONBOARD:START":
-            active_quiz = None
+            with quiz_buffer_lock:
+                active_quiz = None
+                quiz_buffer.clear()
+                quiz_ready_event.clear()
             if main_input_queue:
                 main_input_queue.put("[SYS_ONBOARD_GREET]")
             return
@@ -622,6 +1038,8 @@ class HoldToTalkRecorder:
             self.lang = chosen_lang
             active_quiz = None
             stop_all_voice_playback()
+            # Pre-fetch lebih awal saat user memilih bahasa agar kuis siap saat level diklik
+            refill_quiz_buffer_async(target_lang, user_level, custom_personality, clear_first=True)
             print(f"\n[TUZI ONBOARDING] Bahasa dipilih: {LANGUAGE_NAMES.get(target_lang, target_lang)}")
             if main_input_queue:
                 main_input_queue.put(f"[SYS_ONBOARD_LANG:{target_lang}]")
@@ -631,6 +1049,8 @@ class HoldToTalkRecorder:
             user_level = chosen_level
             active_quiz = None
             stop_all_voice_playback()
+            # Pastikan batch 6 soal sesuai bahasa + level terpilih (pakai hasil pre-fetch jika cocok, atau minta baru)
+            ensure_quiz_batch_for_config(target_lang, user_level, custom_personality)
             print(f"\n[TUZI ONBOARDING] Level dipilih: {user_level} ({target_lang})")
             if main_input_queue:
                 main_input_queue.put(f"[SYS_ONBOARD_LEVEL:{user_level}]")
@@ -690,6 +1110,8 @@ class HoldToTalkRecorder:
                 print(f"\n[Personal Intelligence] Kepribadian kustom aktif: {custom_personality}")
             else:
                 print("\n[Personal Intelligence] Kepribadian dikembalikan ke Default.")
+            # Kosongkan quiz_buffer dan isi ulang 6 soal sesuai Personal Intelligence baru
+            refill_quiz_buffer_async(target_lang, user_level, custom_personality, clear_first=True)
             if main_input_queue:
                 main_input_queue.put(f"[SYS_CUSTOM_PROMPT:{custom_text}]")
             return
@@ -833,17 +1255,23 @@ ptt_recorder = HoldToTalkRecorder()
 
 
 def handle_teach_mode(user_input: str, bridge):
-    """Menangani input selama aplikasi Tuzi 1.0 berjalan & meminta LLM membuat Kuis Pilihan Ganda."""
+    """
+    Menangani input percakapan selama Tuzi 1.0 berjalan.
+    Catatan arsitektur: pembuatan [QUIZ_DATA: ...] per giliran chat dihapus agar FAST_CHAT_MODEL
+    hanya menghasilkan respons percakapan singkat (< 0.8s) + tag [EMO:...], sedangkan soal
+    pilihan ganda disuplai dari antrean pre-fetch quiz_buffer (QUIZ_GEN_MODEL).
+    """
     global is_active, custom_personality
 
     if user_input.startswith("[SYS_CUSTOM_PROMPT:"):
         custom_personality = user_input[len("[SYS_CUSTOM_PROMPT:"):-1].strip()
+        refill_quiz_buffer_async(target_lang, user_level, custom_personality, clear_first=True)
         return None
 
     is_teach_input = False
     if user_input.startswith("[TEACH_INPUT]"):
         is_teach_input = True
-        user_input = user_input.replace("[TEACH_INPUT]", "").strip()
+        user_input = user_input.replace("[TEACH_INPUT]", "", 1).strip()
 
     exit_trigger = re.search(
         r"\b(exit\s+teach|keluar\s+mode\s+belajar|stop\s+belajar|tutup\s+mode\s+belajar)\b",
@@ -856,25 +1284,20 @@ def handle_teach_mode(user_input: str, bridge):
 
     if is_active and is_teach_input:
         lang_label = LANGUAGE_NAMES.get(target_lang, target_lang)
-        level_guide = LEVEL_PEDAGOGY.get(user_level, LEVEL_PEDAGOGY["Beginner"])
-        script_rule = (
-            "Write 'text' in clear Romanized script (Romaji/Pinyin/Revised Romanization) with spaces between words so Zak can read it word-by-word, and put the native characters in 'native'."
-            if target_lang in ["ja-JP", "ko-KR", "zh-CN"]
-            else "Write 'text' and 'native' in standard target language words separated by spaces."
-        )
         persona_rule = (
-            f"IMPORTANT PERSONAL INTELLIGENCE OVERRIDE: You MUST adopt this exact attitude and speaking style: '{custom_personality}'. "
+            f"PERSONAL INTELLIGENCE OVERRIDE: wajib ikuti gaya bicara ini: '{custom_personality}'. "
             if custom_personality
-            else "Keep your current persona mode. "
+            else "Tetap hangat, sabar, dan jelas sebagai guru bahasa; jangan sarkas/tsundere/flirty. "
         )
+        active_q_info = ""
+        if active_quiz and active_quiz.get("question") and ui_submode == "live":
+            active_q_info = f'Active screen quiz question: "{active_quiz["question"]}". '
+
         user_input += (
-            f"\n\n[SYSTEM INFO - DUOLINGO SPEAKING & GRAMMAR TUTOR | Target Language: {lang_label} | Level: {user_level}: "
-            f"1. {persona_rule}"
-            f"2. {level_guide} "
-            "3. Ask Zak a short conversational question or grammar challenge (under 18 words). "
-            "4. MANDATORY: At the very end of your reply, append a JSON block in this EXACT format with 1 grammatically correct answer and 2 grammatically incorrect distractors for Zak to choose and read aloud: "
-            f'[QUIZ_DATA: {{"options": [{{"text": "Correct sentence here", "native": "Native script here", "is_correct": true}}, {{"text": "Wrong grammar 1", "native": "Wrong 1", "is_correct": false}}, {{"text": "Wrong grammar 2", "native": "Wrong 2", "is_correct": false}}]}}] '
-            f"5. {script_rule}]"
+            f"\n\n[TUTOR CONTEXT | Language: {lang_label} | Level: {user_level} | "
+            f"{persona_rule}{active_q_info}"
+            "Reply concisely in 1 short line starting with [EMO:natural], [EMO:soft], or [EMO:excited]. "
+            "Do NOT output [QUIZ_DATA] or JSON multiple-choice blocks.]"
         )
 
     return user_input
@@ -981,8 +1404,18 @@ def get_ui_injection_js() -> str:
                 }
                 body.teach-mode-active.dark-mode #tuzi-subtitle-box { color: #FFFFFF !important; }
 
+                /* Saat pilihan muncul: posisi subtitle dihitung JS (--tuzi-sub-top) agar
+                   selalu berada DI ATAS kotak jawaban dan tidak pernah menimpanya */
                 body.teach-mode-active.choices-active #tuzi-subtitle-box {
-                    top: calc(50% - 22px) !important;
+                    top: var(--tuzi-sub-top, calc(50% - 22px)) !important;
+                    font-size: 18px !important;
+                    line-height: 1.45 !important;
+                    max-width: 700px !important;
+                    transition: top 0.35s ease, color 0.25s ease !important;
+                }
+                body.teach-mode-active.choices-active.choices-compact #tuzi-subtitle-box {
+                    font-size: 16px !important;
+                    line-height: 1.4 !important;
                 }
 
                 #tuzi-teach-overlay {
@@ -1006,6 +1439,11 @@ def get_ui_injection_js() -> str:
                     top: 26%;
                     transform: translate(-50%, -50%) scale(0.78);
                 }
+                /* Layar sempit / subtitle panjang: avatar diperkecil agar semua muat */
+                body.teach-mode-active.choices-active.choices-compact-blob #ai-blob-stage {
+                    top: 19%;
+                    transform: translate(-50%, -50%) scale(0.6);
+                }
 
                 /* === CONTAINER PILIHAN BAHASA, LEVEL, & KUIS GRAMMAR DUOLINGO === */
                 #tuzi-choice-container {
@@ -1025,6 +1463,21 @@ def get_ui_injection_js() -> str:
                 }
                 #tuzi-choice-container.show {
                     display: flex;
+                }
+                /* Posisi kotak jawaban dihitung JS (--tuzi-choice-top) tepat di bawah subtitle */
+                body.teach-mode-active.choices-active #tuzi-choice-container {
+                    top: var(--tuzi-choice-top, calc(50% + 36px));
+                    transition: top 0.35s ease;
+                }
+                body.choices-compact .tuzi-quiz-box {
+                    min-height: 52px;
+                    padding-top: 8px;
+                    padding-bottom: 8px;
+                    margin: 5px 0 !important;
+                }
+                body.choices-compact .tuzi-choice-box {
+                    height: 54px;
+                    margin: 7px 10px !important;
                 }
 
                 /* Box Pilihan Bahasa & Level (2 Baris: 3 Atas, 2 Bawah) */
@@ -2090,6 +2543,96 @@ def get_ui_injection_js() -> str:
                 }
                 document.body.classList.remove('choices-active');
             }
+
+            // === AUTO-LAYOUT: SUBTITLE & KOTAK JAWABAN TIDAK BOLEH TUMPANG TINDIH ===
+            // Urutan vertikal saat pilihan aktif: [avatar] -> [subtitle] -> [kotak jawaban] -> [tombol tutup]
+            const CHOICE_GAP = 16;
+            const BLOB_LAYOUT = {
+                normal:  { topFrac: 0.26, scale: 0.78 },
+                compact: { topFrac: 0.19, scale: 0.60 }
+            };
+            // Jarak pusat #ai-blob-stage ke tepi bawah badan blob (hint 32px + wrapper 300px, badan 215px)
+            const BLOB_BOTTOM_FROM_CENTER = 124;
+            let choiceLayoutRaf = 0;
+            let observedSubBox = null;
+            let lastBodyLayoutKey = '';
+
+            function getSubtitleBox() { return document.getElementById('tuzi-subtitle-box'); }
+
+            function measureChoiceLayout(compactBlob) {
+                const vh = window.innerHeight;
+                const cfg = compactBlob ? BLOB_LAYOUT.compact : BLOB_LAYOUT.normal;
+                const blobBottom = cfg.topFrac * vh + cfg.scale * BLOB_BOTTOM_FROM_CENTER + 12;
+                let dockTop = vh - 16;
+                const dock = overlay.querySelector('.discord-call-wrapper');
+                if (dock && dock.offsetParent !== null) dockTop = dock.getBoundingClientRect().top - 14;
+                const sub = getSubtitleBox();
+                const subH = (sub && sub.textContent.trim() !== '') ? sub.offsetHeight : 0;
+                const choiceH = choiceContainer.offsetHeight;
+                const needed = subH + (subH ? CHOICE_GAP : 0) + choiceH;
+                return { blobBottom, dockTop, subH, needed, available: dockTop - blobBottom };
+            }
+
+            function applyChoiceLayout() {
+                choiceLayoutRaf = 0;
+                const body = document.body;
+                if (!choiceContainer || !body.classList.contains('choices-active')) {
+                    body.classList.remove('choices-compact', 'choices-compact-blob');
+                    body.style.removeProperty('--tuzi-sub-top');
+                    body.style.removeProperty('--tuzi-choice-top');
+                    return;
+                }
+                // 'choices-compact' hanya mengubah ukuran teks/kotak (tanpa animasi) sehingga aman diukur ulang
+                body.classList.remove('choices-compact');
+                let L = measureChoiceLayout(false);
+                let compact = false;
+                if (L.needed > L.available) {
+                    compact = true;
+                    body.classList.add('choices-compact');
+                    L = measureChoiceLayout(true);
+                }
+                body.classList.toggle('choices-compact-blob', compact);
+
+                let start;
+                if (L.needed <= L.available) {
+                    start = L.blobBottom + Math.min((L.available - L.needed) / 2, 56);
+                } else {
+                    start = Math.max(8, L.dockTop - L.needed); // ruang sangat sempit: tempel ke tombol bawah
+                }
+                const choiceTop = start + L.subH + (L.subH ? CHOICE_GAP : 0);
+                body.style.setProperty('--tuzi-sub-top', Math.round(start) + 'px');
+                body.style.setProperty('--tuzi-choice-top', Math.round(choiceTop) + 'px');
+            }
+
+            function scheduleChoiceLayout() {
+                if (!choiceLayoutRaf) choiceLayoutRaf = requestAnimationFrame(applyChoiceLayout);
+            }
+
+            const choiceLayoutRO = (typeof ResizeObserver !== 'undefined') ? new ResizeObserver(scheduleChoiceLayout) : null;
+            if (choiceLayoutRO && choiceContainer) choiceLayoutRO.observe(choiceContainer);
+
+            function attachSubtitleObserver() {
+                const sub = getSubtitleBox();
+                if (!sub || sub === observedSubBox) return;
+                if (choiceLayoutRO) {
+                    if (observedSubBox) choiceLayoutRO.unobserve(observedSubBox);
+                    choiceLayoutRO.observe(sub);
+                }
+                new MutationObserver(scheduleChoiceLayout).observe(sub, { childList: true, characterData: true, subtree: true });
+                observedSubBox = sub;
+            }
+            attachSubtitleObserver();
+
+            new MutationObserver(() => {
+                attachSubtitleObserver();
+                const b = document.body.classList;
+                const key = ['choices-active', 'chat-tab-open', 'fullscreen-mode'].map(c => b.contains(c) ? 1 : 0).join('');
+                if (key !== lastBodyLayoutKey) {
+                    lastBodyLayoutKey = key;
+                    scheduleChoiceLayout();
+                }
+            }).observe(document.body, { attributes: true, attributeFilter: ['class'], childList: true });
+            window.addEventListener('resize', scheduleChoiceLayout);
 
             // Render Kuis Pilihan Ganda Grammar & Speaking (Logo Volume di Kiri + Kata Abu-abu di Tengah)
             window.renderGrammarQuiz = function(quizDataJson) {

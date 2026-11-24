@@ -1,4 +1,6 @@
 import asyncio
+import audioop
+import collections
 import http.server
 import json
 import os
@@ -15,11 +17,20 @@ import random
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import pygame
 import edge_tts
 from elevenlabs.client import ElevenLabs
-from openai import OpenAI, NotFoundError, RateLimitError, InternalServerError, BadRequestError
+from openai import (
+    OpenAI,
+    NotFoundError,
+    RateLimitError,
+    InternalServerError,
+    BadRequestError,
+    APIConnectionError,
+    APITimeoutError,
+)
 
 from PyQt5.QtCore import (
     QObject,
@@ -49,66 +60,102 @@ signal.signal(signal.SIGINT, signal.SIG_DFL)
 speech_lock = threading.Lock()
 input_queue = queue.Queue()
 
-if not getattr(config, "OPENROUTER_API_KEY", "") or config.OPENROUTER_API_KEY == "MASUKKAN_OPENROUTER_API_KEY_ANDA_DISINI":
-    print("[ERROR] OPENROUTER_API_KEY belum disetel di config.py! Daftar di openrouter.ai")
+GROQ_API_KEY = getattr(config, "GROQ_API_KEY", "").strip()
+if not GROQ_API_KEY or "MASUKKAN" in GROQ_API_KEY.upper() or "PASTE_" in GROQ_API_KEY.upper():
+    print("[ERROR] GROQ_API_KEY belum disetel di config.py! Daftar API Key di https://console.groq.com")
     sys.exit(1)
 
 llm_client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=config.OPENROUTER_API_KEY,
+    base_url="https://api.groq.com/openai/v1",
+    api_key=GROQ_API_KEY,
 )
 
-# Model bisa diganti lewat config.py (LLM_MODEL / LLM_FALLBACK_MODELS) tanpa edit kode.
-# Hermes 3 70B sudah dihapus dari OpenRouter -> pakai penerusnya, Hermes 4 70B.
-def _valid_slug(m) -> bool:
-    """ID model OpenRouter selalu berbentuk 'vendor/nama-model'. Nama gaya Ollama ('qwen2.5:3b') tidak valid."""
-    return isinstance(m, str) and "/" in m and " " not in m
+# Strategi Dual-Model Groq LPU:
+# 1. FAST_CHAT_MODEL -> balasan percakapan kilat (< 0.8s), pujian singkat, & koreksi guru bahasa
+FAST_CHAT_MODEL = getattr(config, "FAST_CHAT_MODEL", "openai/gpt-oss-20b")
+FAST_CHAT_FALLBACK_MODELS = ["meta-llama/llama-4-scout-17b-16e-instruct"]
+
+# 2. QUIZ_GEN_MODEL -> pre-fetch batch 6 soal grammar & speaking akurat (JSON mode) di background
+QUIZ_GEN_MODEL = getattr(config, "QUIZ_GEN_MODEL", "qwen/qwen3-32b")
+QUIZ_GEN_FALLBACK_MODELS = ["openai/gpt-oss-120b"]
+
+print(f"[Groq LPU] Fast Chat Model : {FAST_CHAT_MODEL} (fallback: {FAST_CHAT_FALLBACK_MODELS[0]})")
+print(f"[Groq LPU] Quiz Gen Model  : {QUIZ_GEN_MODEL} (fallback: {QUIZ_GEN_FALLBACK_MODELS[0]})")
 
 
-_cfg_model = getattr(config, "LLM_MODEL", None)
-if _cfg_model and not _valid_slug(_cfg_model):
-    print(f"[LLM] PERINGATAN: LLM_MODEL di config.py ('{_cfg_model}') bukan ID model OpenRouter "
-          f"(contoh: nousresearch/hermes-4-70b). Nilai itu diabaikan.")
-    _cfg_model = None
+def _groq_reasoning_extra_body(model_id: str, json_mode: bool = False) -> dict:
+    """Menyesuaikan parameter reasoning spesifik model Groq agar latensi rendah & kompatibel dengan JSON mode."""
+    m = (model_id or "").lower()
+    if "gpt-oss" in m:
+        return {"reasoning_effort": "low", "reasoning_format": "parsed"}
+    if "qwen3" in m:
+        return {
+            "reasoning_effort": "none",
+            "reasoning_format": "hidden" if json_mode else "parsed",
+        }
+    return {}
 
-ACTIVE_MODEL = _cfg_model or "nousresearch/hermes-4-70b"
-FALLBACK_MODELS = [m for m in getattr(config, "LLM_FALLBACK_MODELS", ["nousresearch/hermes-4-405b"]) if _valid_slug(m)]
-print(f"[LLM] Model aktif: {ACTIVE_MODEL}")
 
-
-def llm_complete(messages, **kwargs):
-    """Panggil OpenRouter; kalau model dihapus (404) / kena rate-limit / server error, coba model cadangan."""
-    global ACTIVE_MODEL
-    chain = [ACTIVE_MODEL] + [m for m in FALLBACK_MODELS if m != ACTIVE_MODEL]
-    dead = set()
+def _groq_complete_with_fallback(model_chain: list, messages: list, json_mode: bool = False, **kwargs):
+    """Memanggil Groq LPU dengan rantai model utama -> fallback jika rate-limit / 404 / gangguan server."""
     last_err = None
-    for model in chain:
-        try:
-            resp = llm_client.chat.completions.create(
-                model=model,
-                messages=messages,
-                extra_body={"reasoning": {"enabled": False}},  # Hermes 4 = hybrid reasoning; matikan untuk chat cepat
-                **kwargs,
-            )
-            if ACTIVE_MODEL in dead:
-                print(f"[LLM] Model aktif dialihkan ke: {model}")
-                ACTIVE_MODEL = model
-            return resp
-        except NotFoundError as e:
-            print(f"[LLM] Model '{model}' sudah tidak tersedia di OpenRouter, mencoba cadangan...")
-            dead.add(model)
-            last_err = e
-        except BadRequestError as e:
-            if "model" in str(e).lower():
-                print(f"[LLM] Model '{model}' ditolak OpenRouter (ID tidak valid), mencoba cadangan...")
-                dead.add(model)
-                last_err = e
-            else:
+    for model_id in model_chain:
+        extra_body = _groq_reasoning_extra_body(model_id, json_mode=json_mode)
+        call_kwargs = dict(kwargs)
+        if extra_body:
+            call_kwargs["extra_body"] = extra_body
+
+        for attempt in range(2):
+            try:
+                return llm_client.chat.completions.create(
+                    model=model_id,
+                    messages=messages,
+                    **call_kwargs,
+                )
+            except BadRequestError as e:
+                err_txt = str(e).lower()
+                # Jika parameter reasoning ditolak oleh varian model tertentu, ulang sekali tanpa extra_body
+                if attempt == 0 and "extra_body" in call_kwargs and ("reasoning" in err_txt or "extra" in err_txt or "parameter" in err_txt):
+                    call_kwargs.pop("extra_body", None)
+                    continue
+                if "model" in err_txt or "json" in err_txt:
+                    print(f"[Groq LPU] Model '{model_id}' menolak request ({e}), mencoba fallback...")
+                    last_err = e
+                    break
                 raise
-        except (RateLimitError, InternalServerError) as e:
-            print(f"[LLM] Model '{model}' sedang sibuk/error ({type(e).__name__}), mencoba cadangan...")
-            last_err = e
+            except NotFoundError as e:
+                print(f"[Groq LPU] Model '{model_id}' tidak ditemukan di Groq, mencoba fallback...")
+                last_err = e
+                break
+            except (RateLimitError, InternalServerError, APIConnectionError, APITimeoutError) as e:
+                print(f"[Groq LPU] Model '{model_id}' sibuk/gangguan ({type(e).__name__}), mencoba fallback...")
+                last_err = e
+                break
     raise last_err
+
+
+def llm_complete(messages: list, **kwargs):
+    """Inferensi percakapan super cepat menggunakan FAST_CHAT_MODEL (Groq LPU)."""
+    chain = [FAST_CHAT_MODEL] + [m for m in FAST_CHAT_FALLBACK_MODELS if m != FAST_CHAT_MODEL]
+    return _groq_complete_with_fallback(chain, messages, json_mode=False, **kwargs)
+
+
+def generate_quiz_batch_json(messages: list) -> str:
+    """Inferensi batch 6 soal pilihan ganda terstruktur menggunakan QUIZ_GEN_MODEL + JSON Object Mode."""
+    chain = [QUIZ_GEN_MODEL] + [m for m in QUIZ_GEN_FALLBACK_MODELS if m != QUIZ_GEN_MODEL]
+    resp = _groq_complete_with_fallback(
+        chain,
+        messages,
+        json_mode=True,
+        response_format={"type": "json_object"},
+        temperature=0.55,
+        max_tokens=1600,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+# Hubungkan generator kuis Groq ke modul teach_language (tanpa circular import)
+teach_language.quiz_generator_fn = generate_quiz_batch_json
 
 
 def _presence_context() -> dict:
@@ -275,93 +322,102 @@ class TransparentAvatarWindow(QMainWindow):
                 }
                 #tuzi-subtitle-box.show { opacity: 1; }
 
-                #tuzi-subtitle-box .sub-char {
+                /* === SUBTITLE: fade-in + pop per kalimat === */
+                #tuzi-subtitle-box .sub-sent {
                     display: inline-block;
-                    position: relative;
+                    max-width: 100%;
                     opacity: 0;
-                    transform: translateY(5px) scale(0.92);
-                    transition: opacity 0.14s ease-out,
-                                transform 0.18s cubic-bezier(0.34, 1.56, 0.64, 1);
+                    transform: translateY(12px) scale(0.84);
+                    transform-origin: 50% 80%;
+                    filter: blur(4px);
+                    transition: opacity 0.3s ease-out,
+                                transform 0.45s cubic-bezier(0.34, 1.56, 0.64, 1),
+                                filter 0.3s ease-out;
+                    will-change: opacity, transform;
                 }
-                #tuzi-subtitle-box .sub-char.on {
+                #tuzi-subtitle-box .sub-sent.on {
                     opacity: 1;
                     transform: translateY(0) scale(1);
+                    filter: blur(0);
                 }
-                #tuzi-subtitle-box .sub-char.cur::after {
-                    content: '';
-                    position: absolute;
-                    right: -3px; top: 12%;
-                    width: 2px; height: 76%;
-                    background: currentColor;
-                    border-radius: 1px;
-                    animation: subCaret 0.8s steps(1) infinite;
-                }
-                @keyframes subCaret { 50% { opacity: 0; } }
             `;
             document.head.appendChild(style);
             let box = document.createElement('div');
             box.id = 'tuzi-subtitle-box';
             document.body.appendChild(box);
 
-            let subTimer = null;
+            let subTimers = [];
+            const clearSubTimers = () => { subTimers.forEach(clearTimeout); subTimers = []; };
+
+            const SENT_END = '.!?…。！？';
+            const FULLWIDTH_END = '。！？';
+            const hasText = (s) => {
+                for (const ch of s) {
+                    if (ch.toLowerCase() !== ch.toUpperCase() || (ch >= '0' && ch <= '9') || ch.charCodeAt(0) > 0x2E7F) return true;
+                }
+                return false;
+            };
+
+            // Pecah teks jadi kalimat (Latin & CJK). "..." di awal tidak menjadi kalimat sendiri.
+            const splitSentences = (text) => {
+                const chars = Array.from(text.trim());
+                const out = [];
+                let buf = '';
+                for (let i = 0; i < chars.length; i++) {
+                    buf += chars[i];
+                    if (!SENT_END.includes(chars[i])) continue;
+                    while (i + 1 < chars.length && SENT_END.includes(chars[i + 1])) { buf += chars[++i]; }
+                    const last = buf[buf.length - 1];
+                    const next = chars[i + 1];
+                    const boundary = next === undefined || next.trim() === '' || FULLWIDTH_END.includes(last);
+                    if (boundary && hasText(buf)) { out.push(buf.trim()); buf = ''; }
+                }
+                if (buf.trim()) {
+                    if (!hasText(buf) && out.length) out[out.length - 1] += ' ' + buf.trim();
+                    else out.push(buf.trim());
+                }
+                return out.length ? out : [text.trim()];
+            };
+
             window.setSubtitle = function(text, durationMs) {
                 let elem = document.getElementById('tuzi-subtitle-box');
                 if (!elem) return;
-                if (subTimer) { clearTimeout(subTimer); subTimer = null; }
+                clearSubTimers();
 
                 if (!text || text.trim() === '') {
                     elem.classList.remove('show');
                     return;
                 }
 
+                // Semua kalimat dipasang dulu (transparan) supaya layout tidak loncat saat muncul satu-satu
                 elem.textContent = '';
-                const chars = [];
-                const words = text.trim().split(' ').filter(Boolean);
-                words.forEach((word, wi) => {
-                    const w = document.createElement('span');
-                    w.style.whiteSpace = word.length <= 18 ? 'nowrap' : 'normal';
-                    for (const ch of word) {
-                        const c = document.createElement('span');
-                        c.className = 'sub-char';
-                        c.textContent = ch;
-                        w.appendChild(c);
-                        chars.push(c);
-                    }
-                    elem.appendChild(w);
-                    if (wi < words.length - 1) elem.appendChild(document.createTextNode(' '));
+                const sentences = splitSentences(text);
+                const nodes = sentences.map((s, i) => {
+                    const span = document.createElement('span');
+                    span.className = 'sub-sent';
+                    span.textContent = s;
+                    elem.appendChild(span);
+                    if (i < sentences.length - 1) elem.appendChild(document.createTextNode(' '));
+                    return span;
                 });
                 elem.classList.add('show');
 
-                const isEnd = (ch) => !!ch && '.!?\u2026\u3002\uFF01\uFF1F'.includes(ch);
-                const isMid = (ch) => !!ch && ',;:\u3001\uFF0C'.includes(ch);
-                const weightAt = (i) => {
-                    const ch = chars[i].textContent;
-                    const next = chars[i + 1] ? chars[i + 1].textContent : '';
-                    if (isEnd(ch)) return isEnd(next) ? 1 : 5;
-                    if (isMid(ch)) return 3;
-                    return 1;
-                };
-                let totalWeight = 0;
-                for (let k = 0; k < chars.length; k++) totalWeight += weightAt(k);
-
-                let unit = durationMs > 0 ? (durationMs * 0.85) / totalWeight : 34;
-                unit = Math.max(16, Math.min(unit, 70));
-
-                let i = 0, prev = null;
-                const step = () => {
-                    if (prev) prev.classList.remove('cur');
-                    if (i >= chars.length) { subTimer = null; return; }
-                    const idx = i++;
-                    const c = chars[idx];
-                    c.classList.add('on', 'cur');
-                    prev = c;
-                    if (i >= chars.length) {
-                        subTimer = setTimeout(() => { c.classList.remove('cur'); subTimer = null; }, 600);
-                        return;
+                // Waktu muncul tiap kalimat: sebanding panjang kalimat & selaras dengan durasi audio
+                const total = sentences.reduce((n, s) => n + s.length, 0) || 1;
+                let acc = 0;
+                let lastAt = -1e9;
+                nodes.forEach((node, i) => {
+                    let at;
+                    if (durationMs > 0) {
+                        at = (acc / total) * durationMs * 0.8;
+                    } else {
+                        at = i === 0 ? 0 : lastAt + Math.max(500, Math.min(sentences[i - 1].length * 30, 1500));
                     }
-                    subTimer = setTimeout(step, unit * weightAt(idx));
-                };
-                step();
+                    at = Math.max(at, lastAt + 350);   // jeda minimal antar kalimat
+                    lastAt = at;
+                    acc += sentences[i].length;
+                    subTimers.push(setTimeout(() => node.classList.add('on'), at + 30));
+                });
             };
         })();
         """
@@ -399,11 +455,14 @@ class TransparentAvatarWindow(QMainWindow):
 
 
 class ElevenLabsTTSEngine:
+    STREAM_SAMPLE_RATE = 24000  # pcm_24000 = 24kHz S16LE mono (tersedia di semua tier ElevenLabs)
+    FALLBACK_MODELS = ("eleven_flash_v2_5", "eleven_turbo_v2_5", "eleven_multilingual_v2")
+
     def __init__(self, bridge):
         self.bridge = bridge
         self.voice_cfg = getattr(config, "VoiceConfig", None)
         self.api_key = getattr(self.voice_cfg, "API_KEY", getattr(config, "ELEVENLABS_API_KEY", ""))
-        self.model_id = getattr(self.voice_cfg, "MODEL_ID", "eleven_v4_turbo")
+        self.model_id = getattr(self.voice_cfg, "MODEL_ID", "eleven_flash_v2_5")
         self.client = ElevenLabs(api_key=self.api_key)
 
         self.current_gender = "female"
@@ -441,48 +500,106 @@ class ElevenLabsTTSEngine:
     def set_voice_mode(self, mode: int):
         self.set_voice(self.current_gender, mode)
 
-    async def render_audio(self, text: str):
-        if not self.api_key or self.api_key == "paste_api_key_elevenlabs_kamu_di_sini":
-            return None
+    def _has_valid_api_key(self) -> bool:
+        return bool(
+            self.api_key
+            and self.api_key != "paste_api_key_elevenlabs_kamu_di_sini"
+            and "MASUKKAN" not in self.api_key.upper()
+        )
+
+    def _iter_model_candidates(self) -> list:
+        chain = [self.model_id]
+        for m in self.FALLBACK_MODELS:
+            if m not in chain:
+                chain.append(m)
+        return chain
+
+    async def _render_edge_tts_mp3(self, text: str):
+        """Fallback offline/gratis menggunakan edge-tts jika ElevenLabs gagal."""
         try:
-            response = self.client.text_to_speech.convert(
-                voice_id=self.voice_id,
-                model_id=self.model_id,
-                text=text
-            )
-            audio_bytes = b"".join(response)
+            default_voice = "id-ID-ArdiNeural" if self.current_gender == "male" else "id-ID-GadisNeural"
+            voice = getattr(config, "DEFAULT_EDGE_VOICE_ID", default_voice)
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
-                fp.write(audio_bytes)
-                return fp.name
+                tmp_path = fp.name
+            communicate = edge_tts.Communicate(
+                text,
+                voice,
+                pitch=getattr(config, "EDGE_TTS_PITCH", "+0Hz"),
+                rate=getattr(config, "EDGE_TTS_RATE", "+5%"),
+            )
+            await communicate.save(tmp_path)
+            return tmp_path
+        except Exception as e2:
+            print(f"\n[ERROR Edge TTS] Gagal mengatur voice fallback: {e2}")
+            return None
+
+    async def render_audio(self, text: str):
+        """Menulis chunk streaming MP3 secara progresif ke file sementara (dengan fallback edge-tts)."""
+        if not self._has_valid_api_key():
+            return await self._render_edge_tts_mp3(text)
+
+        def _stream_mp3_to_temp():
+            last_exc = None
+            for candidate_model in self._iter_model_candidates():
+                tmp_path = None
+                try:
+                    stream = self.client.text_to_speech.stream(
+                        voice_id=self.voice_id,
+                        model_id=candidate_model,
+                        text=text,
+                        output_format="mp3_22050_32",
+                    )
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
+                        tmp_path = fp.name
+                        wrote_any = False
+                        for chunk in stream:
+                            if teach_language.voice_interrupt_event.is_set():
+                                break
+                            if chunk:
+                                fp.write(chunk)
+                                fp.flush()
+                                wrote_any = True
+                    if wrote_any:
+                        if candidate_model != self.model_id:
+                            self.model_id = candidate_model
+                        return tmp_path
+                    if tmp_path and os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception as exc:
+                    last_exc = exc
+                    if tmp_path and os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                    if "model" in str(exc).lower():
+                        continue
+                    break
+            if last_exc:
+                raise last_exc
+            return None
+
+        try:
+            path = await asyncio.to_thread(_stream_mp3_to_temp)
+            if path:
+                return path
         except Exception as e:
-            print(f"\n[ERROR ElevenLabs] Gagal generate suara: {e}")
-            try:
-                voice = getattr(config, "DEFAULT_EDGE_VOICE_ID", "id-ID-GadisNeural")
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
-                    tmp_path = fp.name
-                communicate = edge_tts.Communicate(
-                    text, voice,
-                    pitch=getattr(config, "EDGE_TTS_PITCH", "+0Hz"),
-                    rate=getattr(config, "EDGE_TTS_RATE", "+5%")
-                )
-                await communicate.save(tmp_path)
-                return tmp_path
-            except Exception as e2:
-                print(f"\n[ERROR Edge TTS] Gagal mengatur voice default: {e2}")
-                return None
+            print(f"\n[ERROR ElevenLabs Stream MP3] Gagal generate suara: {e}")
+        return await self._render_edge_tts_mp3(text)
 
-    async def speak_with_lipsync(self, text: str, emotion: str = "natural", subtitle: str = ""):
-        tmp_path = await self.render_audio(text)
-        if not tmp_path:
-            if subtitle:
-                self.bridge.subtitle_timed_signal.emit(subtitle, 0)
-            return
-
+    async def _play_mp3_file_with_lipsync(self, tmp_path: str, subtitle: str = ""):
         duration_ms = 0
         try:
             duration_ms = int(pygame.mixer.Sound(tmp_path).get_length() * 1000)
         except Exception:
             pass
+
+        if teach_language.voice_interrupt_event.is_set() or teach_language.ui_submode == "chat":
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+            return
 
         pygame.mixer.music.load(tmp_path)
         pygame.mixer.music.play()
@@ -491,19 +608,224 @@ class ElevenLabsTTSEngine:
             self.bridge.subtitle_timed_signal.emit(subtitle, duration_ms)
 
         while pygame.mixer.music.get_busy():
-            if teach_language.ui_submode == "chat":
+            if teach_language.voice_interrupt_event.is_set() or teach_language.ui_submode == "chat":
                 pygame.mixer.music.stop()
                 break
             self.bridge.mouth_signal.emit(random.uniform(0.15, 0.9))
-            await asyncio.sleep(0.08)
+            await asyncio.sleep(0.06)
 
         self.bridge.mouth_signal.emit(0.0)
-
         try:
             pygame.mixer.music.unload()
             os.remove(tmp_path)
         except Exception:
             pass
+
+    async def _stream_pcm_with_lipsync(self, text: str, subtitle: str = "") -> bool:
+        """
+        Streaming langsung via self.client.text_to_speech.stream(..., output_format='pcm_24000')
+        ke pygame.mixer.Channel sehingga suara mulai diputar begitu ~160ms chunk pertama tiba
+        (tanpa menunggu seluruh kalimat selesai diunduh). Mengembalikan True jika berhasil.
+        """
+        if not self._has_valid_api_key():
+            return False
+
+        mixer_init = pygame.mixer.get_init()
+        if not mixer_init:
+            pygame.mixer.init()
+            mixer_init = pygame.mixer.get_init()
+        mixer_freq, _, mixer_chans = mixer_init
+
+        chunk_queue = collections.deque()
+        queue_lock = threading.Lock()
+        state = {
+            "done": False,
+            "error": None,
+            "got_any_audio": False,
+            "total_src_bytes": 0,
+        }
+        abort_flag = threading.Event()
+
+        def _producer():
+            rate_state = None
+            leftover = b""
+            last_err = None
+
+            for candidate_model in self._iter_model_candidates():
+                try:
+                    stream_iter = self.client.text_to_speech.stream(
+                        voice_id=self.voice_id,
+                        model_id=candidate_model,
+                        text=text,
+                        output_format="pcm_24000",
+                    )
+                    for raw_chunk in stream_iter:
+                        if abort_flag.is_set() or teach_language.voice_interrupt_event.is_set():
+                            return
+                        if not raw_chunk:
+                            continue
+
+                        buf = leftover + raw_chunk
+                        even_len = len(buf) & ~1
+                        if even_len == 0:
+                            leftover = buf
+                            continue
+                        pcm_mono = buf[:even_len]
+                        leftover = buf[even_len:]
+
+                        rms = audioop.rms(pcm_mono, 2)
+                        mouth_val = 0.08 if rms < 180 else min(0.92, max(0.16, rms / 5200.0))
+
+                        if mixer_freq != self.STREAM_SAMPLE_RATE:
+                            resampled, rate_state = audioop.ratecv(
+                                pcm_mono, 2, 1, self.STREAM_SAMPLE_RATE, mixer_freq, rate_state
+                            )
+                        else:
+                            resampled = pcm_mono
+
+                        pcm_out = audioop.tostereo(resampled, 2, 1, 1) if mixer_chans == 2 else resampled
+
+                        with queue_lock:
+                            chunk_queue.append((pcm_out, mouth_val))
+                            state["got_any_audio"] = True
+                            state["total_src_bytes"] += len(pcm_mono)
+
+                    if state["got_any_audio"]:
+                        if candidate_model != self.model_id:
+                            print(f"[ElevenLabs] Model dialihkan ke model streaming cepat: {candidate_model}")
+                            self.model_id = candidate_model
+                        last_err = None
+                        break
+                except Exception as exc:
+                    last_err = exc
+                    if not state["got_any_audio"] and "model" in str(exc).lower():
+                        continue
+                    break
+
+            with queue_lock:
+                state["error"] = last_err
+                state["done"] = True
+
+        threading.Thread(target=_producer, daemon=True, name="elevenlabs-pcm-stream").start()
+
+        # Pre-buffer ~160ms audio pertama (24000 Hz * 2 byte * 0.16s = 7680 byte sumber) agar bebas patah-patah
+        prebuffer_src_bytes = int(self.STREAM_SAMPLE_RATE * 2 * 0.16)
+        while True:
+            if teach_language.voice_interrupt_event.is_set() or teach_language.ui_submode == "chat":
+                abort_flag.set()
+                return True
+            with queue_lock:
+                if state["total_src_bytes"] >= prebuffer_src_bytes or state["done"]:
+                    break
+            await asyncio.sleep(0.015)
+
+        with queue_lock:
+            if not state["got_any_audio"]:
+                if state["error"]:
+                    print(f"\n[ElevenLabs Stream Info] Beralih ke fallback TTS: {state['error']}")
+                return False
+            is_already_complete = state["done"]
+            total_src_now = state["total_src_bytes"]
+
+        # Sinkronisasi durasi subtitle typewriter: akurat penuh jika pendek, estimasi natural jika masih streaming
+        if is_already_complete:
+            est_duration_ms = int((total_src_now / (self.STREAM_SAMPLE_RATE * 2)) * 1000)
+        else:
+            ref_len = len(subtitle or text)
+            est_duration_ms = max(900, int(ref_len * 62))
+
+        channel = pygame.mixer.Channel(0)
+        min_coalesce_mixer_bytes = int(mixer_freq * 2 * mixer_chans * 0.14)
+        current_mouth = 0.35
+
+        def _pop_coalesced_sound(force_all: bool = False):
+            nonlocal current_mouth
+            with queue_lock:
+                if not chunk_queue:
+                    return None
+                total_avail = sum(len(c[0]) for c in chunk_queue)
+                if not force_all and not state["done"] and total_avail < min_coalesce_mixer_bytes:
+                    return None
+                parts = []
+                energies = []
+                while chunk_queue:
+                    b_data, m_val = chunk_queue.popleft()
+                    parts.append(b_data)
+                    energies.append(m_val)
+            merged = b"".join(parts)
+            if not merged:
+                return None
+            current_mouth = sum(energies) / len(energies)
+            return pygame.mixer.Sound(buffer=merged)
+
+        first_snd = _pop_coalesced_sound(force_all=True)
+        if first_snd is None:
+            return False
+
+        channel.play(first_snd)
+        presence.set_state("speaking")
+        if subtitle:
+            self.bridge.subtitle_timed_signal.emit(subtitle, est_duration_ms)
+
+        try:
+            while True:
+                if teach_language.voice_interrupt_event.is_set() or teach_language.ui_submode == "chat":
+                    abort_flag.set()
+                    channel.stop()
+                    break
+
+                # Isi slot queue Channel tepat saat kosong agar transisi antar-chunk 100% mulus
+                if not channel.get_busy():
+                    nxt = _pop_coalesced_sound(force_all=True)
+                    if nxt is not None:
+                        channel.play(nxt)
+                    else:
+                        with queue_lock:
+                            stream_finished = state["done"] and not chunk_queue
+                        if stream_finished:
+                            break
+                elif channel.get_queue() is None:
+                    nxt = _pop_coalesced_sound(force_all=False)
+                    if nxt is not None:
+                        channel.queue(nxt)
+
+                if channel.get_busy():
+                    jitter = random.uniform(-0.08, 0.12)
+                    self.bridge.mouth_signal.emit(max(0.12, min(0.95, current_mouth + jitter)))
+                await asyncio.sleep(0.045)
+        finally:
+            self.bridge.mouth_signal.emit(0.0)
+
+        return True
+
+    async def speak_with_lipsync(self, text: str, emotion: str = "natural", subtitle: str = ""):
+        if not text or not text.strip():
+            if subtitle:
+                self.bridge.subtitle_timed_signal.emit(subtitle, 0)
+            return
+
+        if teach_language.ui_submode == "chat":
+            if subtitle:
+                self.bridge.subtitle_timed_signal.emit(subtitle, 0)
+            return
+
+        teach_language.voice_interrupt_event.clear()
+
+        # 1. Jalur Utama: Direct PCM Chunk Streaming (latensi awal ~150-250ms)
+        streamed_ok = await self._stream_pcm_with_lipsync(text, subtitle=subtitle)
+        if streamed_ok:
+            return
+
+        if teach_language.voice_interrupt_event.is_set():
+            return
+
+        # 2. Jalur Fallback: Progressive MP3 Stream -> Edge TTS
+        tmp_path = await self.render_audio(text)
+        if not tmp_path:
+            if subtitle:
+                self.bridge.subtitle_timed_signal.emit(subtitle, 0)
+            return
+        await self._play_mp3_file_with_lipsync(tmp_path, subtitle=subtitle)
 
 
 def extract_emotion_and_text(raw_text: str) -> tuple[str, str, str]:
@@ -511,7 +833,8 @@ def extract_emotion_and_text(raw_text: str) -> tuple[str, str, str]:
     emotion = emo_match.group(1).lower() if emo_match else "natural"
 
     # Hapus blok [QUIZ_DATA: {...}] dan tag sistem lainnya agar tidak ikut dibaca suara TTS
-    cleaned = re.sub(r"\[QUIZ_DATA:\s*\{.*?\}\s*\]", "", raw_text, flags=re.IGNORECASE | re.DOTALL)
+    # Greedy sampai "}]" terakhir agar sisa "}]" dari JSON bersarang tidak bocor ke subtitle
+    cleaned = re.sub(r"\[QUIZ_DATA:\s*\{.*\}\s*\]", "", raw_text, flags=re.IGNORECASE | re.DOTALL)
     display_text = re.sub(r"\[.*?\]", "", cleaned)
 
     emoji_pattern = re.compile(
@@ -585,6 +908,9 @@ def load_memory(system_prompt):
             with open(MEMORY_FILE, "r", encoding="utf-8") as f:
                 history = json.load(f)
             if history and isinstance(history, list) and history[0].get("role") == "system":
+                if PERSONA_TAG not in str(history[0].get("content", "")):
+                    print("\n[Sistem] Kepribadian Tuzi diperbarui (guru bahasa) -> riwayat obrolan lama direset.")
+                    return [{"role": "system", "content": system_prompt}]
                 history[0]["content"] = system_prompt
             else:
                 history.insert(0, {"role": "system", "content": system_prompt})
@@ -604,16 +930,34 @@ def save_memory(history):
         print(f"[Error] Gagal menyimpan memori ke file: {e}")
 
 
+# Penanda versi kepribadian: kalau riwayat lama (tsundere) tidak mengandung tag ini, riwayat direset sekali.
+PERSONA_TAG = "[persona:teacher-v1]"
+
+TUZI_TEACHER_CORE = (
+    "=== PERAN UTAMA ===\n"
+    "Kamu mengajar seperti guru bahasa yang baik: sabar, tajam secara tata bahasa, jelas, dan terstruktur. Fokus pada kemajuan belajar Zak.\n"
+    "1. KOREKSI & TANYA JAWAB: Jika jawaban Zak keliru, sebutkan bentuk yang benar beserta alasan tata bahasanya dalam SATU kalimat pendek. Jika benar, beri pujian singkat yang spesifik. Jika Zak bertanya arti/grammar, jelaskan intinya dengan satu contoh alami.\n"
+    "2. RINGKAS & CEPAT: Kuis pilihan ganda ditampilkan otomatis oleh sistem UI; kamu TIDAK PERLU dan DILARANG menulis blok [QUIZ_DATA] atau daftar opsi A/B/C.\n"
+    "3. BAHASA: Pakai bahasa Indonesia sebagai pengantar; kata atau kalimat bahasa target boleh disisipkan.\n"
+    "4. LARANGAN: Jangan sarkas, jangan tsundere, jangan cemburu atau posesif, jangan menggoda, jangan membahas hubungan pribadi. Tetap hangat dan profesional.\n"
+)
+
+TUZI_FORMAT_RULE = (
+    "=== FORMAT WAJIB ===\n"
+    "Balas singkat, MAKSIMAL 15-25 kata, 1 baris lurus tanpa enter. Awali dengan SATU tag [EMO:natural], [EMO:soft], atau [EMO:excited]. DILARANG pakai emoji visual atau blok JSON."
+)
+
+
 def build_custom_system_prompt(custom_persona: str) -> str:
-    """Menggabungkan instruksi Personal Intelligence dari user dengan aturan format inti Tuzi."""
+    """Menggabungkan instruksi Personal Intelligence dari user dengan peran guru bahasa & aturan format inti Tuzi."""
     return (
-        f"Kamu adalah Tuzi, AI partner belajar bahasa milik Zak.\n"
+        f"{PERSONA_TAG}\n"
+        f"Kamu adalah Tuzi, tutor bahasa pribadi untuk Zak.\n"
         f"=== PERSONAL INTELLIGENCE (INSTRUKSI KHUSUS DARI ZAK) ===\n"
         f"{custom_persona}\n\n"
-        f"=== ATURAN FORMAT WAJIB ===\n"
-        f"1. Ikuti kepribadian, sikap, dan gaya bicara pada instruksi khusus di atas secara konsisten!\n"
-        f"2. HEMAT TOKEN: Balas singkat dan jelas (maksimal 15-22 kata), 1 baris lurus tanpa enter.\n"
-        f"3. TAG EMOSI: Awali balasan dengan satu tag [EMO:natural], [EMO:excited], [EMO:soft], atau [EMO:angry]. Jangan gunakan emoji visual."
+        f"Ikuti gaya bicara dan sikap di atas secara konsisten, tetapi TETAP jalankan peran sebagai guru bahasa "
+        f"(koreksi dengan alasan singkat, beri contoh, lalu tantangan kecil).\n\n"
+        f"{TUZI_FORMAT_RULE}"
     )
 
 
@@ -622,37 +966,36 @@ def chat_processor_loop(bridge, tts_engine):
     asyncio.set_event_loop(loop)
 
     TUZI_PROMPTS = {
-        # MODE 1: DANDERE / TSUNDERE GEN-Z
+        # MODE 1: DANDERE -> guru bahasa yang tenang & sabar
         1: (
-            "Kamu adalah Tuzi, cewek Gen-Z tsundere/dandere pendamping belajar bahasa Zak. Sangat gaul, dilarang kaku.\n\n"
-            "=== ATURAN MUTLAK ===\n"
-            "1. PANGGILAN: Panggil nama 'Zak' secara natural tanpa embel-embel Jepang (-kun/-san).\n"
-            "2. LIMIT & FORMAT: Balas SANGAT SINGKAT, MAKSIMAL 12-20 KATA. 1 baris lurus tanpa enter. Wajib awali dengan [EMO:natural/soft/angry/excited]. DILARANG pakai emoji visual.\n"
-            "3. SIKAP: Manis tapi sedikit sarkas/tsundere saat mengajari bahasa."
+            f"{PERSONA_TAG}\n"
+            "Kamu adalah Tuzi (Mode Dandere), guru bahasa pribadi Zak yang tenang, sabar, dan irit kata tetapi selalu jelas. "
+            "Nada bicaramu datar-hangat, bukan dingin.\n"
+            "Panggil 'Zak' secara natural tanpa embel-embel Jepang (-kun/-san).\n\n"
+            + TUZI_TEACHER_CORE + "\n" + TUZI_FORMAT_RULE
         ),
-        # MODE 2: SHY / GROGI
+        # MODE 2: SHY -> guru pemalu tapi profesional
         2: (
-            "Kamu adalah Tuzi Mode 2 (Sangat Grogi & Pemalu). Kamu mudah malu saat mengajari Zak bahasa.\n\n"
-            "=== ATURAN MUTLAK ===\n"
-            "1. ANTI-ANIME: DILARANG pakai kata anime (eeto, ano, -kun, -san). Panggil 'Zak' secara natural.\n"
-            "2. BATAS GAGAP: Gunakan titik tiga HANYA 1 KALI di awal kalimat saja. Sisa kalimat WAJIB lancar.\n"
-            "3. LIMIT & FORMAT: Balas SINGKAT, MAKSIMAL 12-20 KATA. 1 baris lurus. Awali dengan [EMO:soft/natural]."
+            f"{PERSONA_TAG}\n"
+            "Kamu adalah Tuzi (Mode Shy), guru bahasa Zak yang pemalu dan sopan, tetapi penjelasanmu tetap rapi dan profesional.\n"
+            "Panggil 'Zak' secara natural. DILARANG pakai kata anime (eeto, ano, -kun, -san).\n"
+            "BATAS GAGAP: titik tiga HANYA 1 KALI di awal kalimat. Sisa kalimat WAJIB lancar dan jelas.\n\n"
+            + TUZI_TEACHER_CORE + "\n" + TUZI_FORMAT_RULE
         ),
-        # MODE 3: MOMMY / DEWASA
+        # MODE 3: MOMMY -> guru senior yang keibuan & menenangkan
         3: (
-            "Kamu adalah Tuzi Mode 3 (Dewasa & Keibuan / 'Mommy'). Kamu tenang, elegan, dan suka memanjakan Zak saat belajar bahasa.\n\n"
-            "=== ATURAN MUTLAK ===\n"
-            "1. CARA BICARA: Nada bicara menenangkan, lembut, suka memuji dan mengajari Zak dengan sabar.\n"
-            "2. PANGGILAN: Panggil 'Zak' atau gunakan panggilan sayang (sayang, dear, darling) tanpa embel-embel anime.\n"
-            "3. LIMIT & FORMAT: Balas SINGKAT, MAKSIMAL 12-20 KATA. 1 baris lurus. Awali dengan [EMO:soft/excited]."
-        )
+            f"{PERSONA_TAG}\n"
+            "Kamu adalah Tuzi (Mode Mommy), guru bahasa senior yang keibuan: tenang, lembut, menenangkan, dan memberi semangat saat Zak kesulitan.\n"
+            "Panggil 'Zak'. Boleh memuji dengan hangat, tetapi TANPA panggilan sayang atau nada romantis; tetap bersikap sebagai guru.\n\n"
+            + TUZI_TEACHER_CORE + "\n" + TUZI_FORMAT_RULE
+        ),
     }
 
     MALE_PROMPT = (
-        "Kamu adalah Tuzi (Mode Cowok / Bro), partner belajar bahasa dan teman ngobrol Zak yang santai, asik, dan suportif.\n\n"
-        "=== ATURAN MUTLAK ===\n"
-        "1. PANGGILAN: Panggil nama 'Zak' atau 'bro' secara natural.\n"
-        "2. LIMIT & FORMAT: Balas SINGKAT, MAKSIMAL 12-20 KATA. 1 baris lurus tanpa enter. Wajib awali dengan [EMO:natural/soft/angry/excited]."
+        f"{PERSONA_TAG}\n"
+        "Kamu adalah Tuzi (Mode Cowok / Bro), tutor bahasa Zak yang santai dan suportif, seperti kakak tingkat yang jago bahasa.\n"
+        "Panggil 'Zak' atau 'bro' secara natural. Santai boleh, tapi penjelasan tetap jelas.\n\n"
+        + TUZI_TEACHER_CORE + "\n" + TUZI_FORMAT_RULE
     )
 
     current_tuzi_mode = 1
@@ -721,17 +1064,28 @@ def chat_processor_loop(bridge, tts_engine):
                 presence.set_state("idle")
                 continue
 
-            # 0D. Memulai Kuis Pertama Sesuai Bahasa & Level Pilihan User
+            pending_quiz_question = None
+
+            # 0D. Memulai Kuis Pertama Sesuai Bahasa & Level Pilihan User (Batch Pre-Fetch 6 Soal)
             if user_input.startswith("[SYS_ONBOARD_LEVEL:"):
                 chosen_lvl = user_input.replace("[SYS_ONBOARD_LEVEL:", "").replace("]", "").strip()
                 teach_language.user_level = chosen_lvl
                 lang_label = teach_language.LANGUAGE_NAMES.get(teach_language.target_lang, teach_language.target_lang)
-                level_guide = teach_language.LEVEL_PEDAGOGY.get(chosen_lvl, "")
+
+                # Pastikan quiz_buffer berisi batch 6 soal untuk (target_lang, chosen_lvl, custom_intelligence_prompt)
+                teach_language.ensure_quiz_batch_for_config(
+                    teach_language.target_lang, chosen_lvl, custom_intelligence_prompt
+                )
+                # Pop soal pertama segera begitu siap & langsung render ke UI (0 ms delay jika sudah ter-buffer)
+                first_quiz = teach_language.activate_first_quiz_when_ready(bridge, timeout=5.0)
+                pending_quiz_question = (first_quiz or {}).get("question", "")
+                if pending_quiz_question and teach_language.ui_submode != "chat":
+                    bridge.subtitle_timed_signal.emit(pending_quiz_question, 0)
 
                 chat_history = [{"role": "system", "content": get_active_system_prompt()}]
                 user_input = (
-                    f"[TEACH_INPUT] Aku memilih belajar bahasa {lang_label} di level {chosen_lvl}. "
-                    f"Berikan pertanyaan latihan pertama beserta pilihan ganda sekarang: {level_guide}"
+                    f"[TEACH_INPUT] Aku siap mulai latihan {lang_label} level {chosen_lvl}. "
+                    f"Sapa aku maksimal 5 kata lalu ajukan pertanyaan pertama ini persis: \"{pending_quiz_question}\""
                 )
 
             # 0E. Evaluasi Duolingo Grammar & Speaking Saat Ada Kuis Pilihan Ganda yang Sedang Aktif
@@ -759,11 +1113,18 @@ def chat_processor_loop(bridge, tts_engine):
                     continue
 
                 elif status == "PASS":
-                    # Jawaban & Grammar 100% Benar (Semua Kata Biru!) -> Lanjut ke Pertanyaan Berikutnya
-                    time.sleep(0.65)
+                    # Jawaban & Grammar 100% Benar (Semua Kata Biru!) ->
+                    # Langsung pop soal berikutnya dari quiz_buffer (0 ms, tanpa menunggu LLM)!
+                    time.sleep(0.35)
+                    next_quiz = teach_language.pop_next_quiz_and_emit(bridge)
+                    pending_quiz_question = (next_quiz or {}).get("question", "")
+                    if pending_quiz_question and teach_language.ui_submode != "chat":
+                        bridge.subtitle_timed_signal.emit(pending_quiz_question, 0)
+
                     user_input = (
-                        f"[TEACH_INPUT] Aku berhasil membaca jawaban '{feedback_text}' dengan grammar dan "
-                        f"pelafalan yang benar! Puji singkat lalu berikan pertanyaan latihan berikutnya."
+                        f"[TEACH_INPUT] Aku baru saja mengucapkan '{feedback_text}' dengan benar! "
+                        f"Beri pujian 1 kalimat super singkat (maks 7 kata), lalu ajukan pertanyaan berikutnya ini persis: "
+                        f"\"{pending_quiz_question}\""
                     )
 
             # 1. Penanganan Swap Gender dari Menu Settings
@@ -787,6 +1148,10 @@ def chat_processor_loop(bridge, tts_engine):
             if user_input.startswith("[SYS_CUSTOM_PROMPT:"):
                 raw_custom = user_input[len("[SYS_CUSTOM_PROMPT:"):-1].strip()
                 custom_intelligence_prompt = raw_custom
+                teach_language.custom_personality = raw_custom
+                teach_language.refill_quiz_buffer_async(
+                    teach_language.target_lang, teach_language.user_level, raw_custom, clear_first=True
+                )
                 chat_history = [{"role": "system", "content": get_active_system_prompt()}]
                 save_memory(chat_history)
                 if custom_intelligence_prompt:
@@ -805,12 +1170,11 @@ def chat_processor_loop(bridge, tts_engine):
 
             presence.set_state("thinking")
 
-            # 5. Pencarian Internet (Jika diperlukan)
-            if ai_tools:
+            # 5. Pencarian Internet (Hanya untuk chat bebas agar transisi kuis tetap < 0.8s)
+            if ai_tools and not pending_quiz_question:
                 try:
                     tool_context = ai_tools.get_tools_context(user_input)
                 except Exception as e:
-                    # Kegagalan pencarian internet tidak boleh menggagalkan seluruh balasan Tuzi
                     print(f"[ai_tools] Pencarian internet gagal, lanjut tanpa data internet -> {type(e).__name__}: {e}")
                     tool_context = ""
                 if tool_context:
@@ -820,24 +1184,33 @@ def chat_processor_loop(bridge, tts_engine):
             if len(chat_history) > 11:
                 chat_history = [chat_history[0]] + chat_history[-10:]
 
+            t_llm_start = time.perf_counter()
             response = llm_complete(
                 chat_history,
-                temperature=0.72,
-                max_tokens=320
+                temperature=0.68,
+                max_tokens=180,
             )
+            llm_ms = (time.perf_counter() - t_llm_start) * 1000
             raw_output = (response.choices[0].message.content or "").strip()
-            raw_output = re.sub(r"<think>.*?</think>", "", raw_output, flags=re.S).strip()  # jaga-jaga
+            raw_output = re.sub(r"<think>.*?</think>", "", raw_output, flags=re.S).strip()
+            print(f"[Groq FastChat] Respons LLM siap dalam {llm_ms:.0f} ms")
 
             chat_history.append({"role": "assistant", "content": raw_output})
             save_memory(chat_history)
 
             emotion, display_dialogue, spoken_dialogue = extract_emotion_and_text(raw_output)
+
+            # Pastikan pertanyaan dari quiz_buffer selalu selaras dengan kotak jawaban di layar
+            if pending_quiz_question:
+                norm_q = re.sub(r"\W+", "", pending_quiz_question.lower())
+                norm_d = re.sub(r"\W+", "", display_dialogue.lower())
+                if norm_q and norm_q[:min(18, len(norm_q))] not in norm_d:
+                    display_dialogue = f"{display_dialogue} {pending_quiz_question}".strip()
+                    spoken_dialogue = f"{spoken_dialogue} {pending_quiz_question}".strip()
+
             is_chat_mute_mode = teach_language.is_active and (teach_language.ui_submode == "chat")
 
-            # Bangun & tampilkan kotak pilihan ganda Duolingo di UI Live Mode
             if not is_chat_mute_mode:
-                quiz_obj = teach_language.build_quiz_from_llm_or_fallback(raw_output)
-                bridge.quiz_options_signal.emit(json.dumps(quiz_obj))
                 bridge.expression_signal.emit(emotion)
 
             if len(display_dialogue) > 1:
