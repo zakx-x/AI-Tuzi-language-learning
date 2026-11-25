@@ -1064,9 +1064,131 @@ def chat_processor_loop(bridge, tts_engine):
                 presence.set_state("idle")
                 continue
 
+            def speak_fast_coaching(prompt_text: str, default_emo: str = "soft", fallback_msg: str = "",
+                                    required_sentence: str = "", max_tokens: int = 240):
+                """Helper Stage 1 & Stage 2: panggil FAST_CHAT_MODEL untuk coaching singkat lalu ucapkan via TTS."""
+                presence.set_state("thinking")
+                emo, disp, spk = default_emo, fallback_msg, fallback_msg
+                try:
+                    coach_msgs = [
+                        {"role": "system", "content": get_active_system_prompt()},
+                        {"role": "user", "content": prompt_text},
+                    ]
+                    t0 = time.perf_counter()
+                    resp = llm_complete(coach_msgs, temperature=0.62, max_tokens=max_tokens)
+                    raw_c = (resp.choices[0].message.content or "").strip()
+                    raw_c = re.sub(r"<think>.*?</think>", "", raw_c, flags=re.S).strip()
+                    print(f"[Groq FastChat Coach] Siap dalam {(time.perf_counter() - t0) * 1000:.0f} ms")
+                    if raw_c:
+                        emo, disp, spk = extract_emotion_and_text(raw_c)
+                except Exception as coach_err:
+                    print(f"[Coach Fallback] {coach_err}")
+
+                if required_sentence:
+                    norm_req = re.sub(r"\W+", "", required_sentence.lower())
+                    norm_disp = re.sub(r"\W+", "", disp.lower())
+                    if norm_req and norm_req not in norm_disp:
+                        disp = f"{disp} Dengarkan dan tirukan: {required_sentence}".strip()
+                        spk = f"{spk} Dengarkan dan tirukan: {required_sentence}".strip()
+
+                is_mute = teach_language.is_active and (teach_language.ui_submode == "chat")
+                if not is_mute:
+                    bridge.expression_signal.emit(emo)
+                    if disp:
+                        with speech_lock:
+                            loop.run_until_complete(
+                                tts_engine.speak_with_lipsync(spk, emotion=emo, subtitle=disp)
+                            )
+                    bridge.expression_signal.emit("natural")
+                elif disp:
+                    bridge.subtitle_timed_signal.emit(disp, 0)
+                presence.set_state("idle")
+
+            # 0C-1. Stage 1 (CHOICE_STAGE): User mengklik opsi SALAH -> Jelaskan singkat kesalahan grammar-nya & tetap di Stage 1
+            if user_input.startswith("[SYS_QUIZ_WRONG_CLICK:"):
+                try:
+                    clicked_idx = int(user_input[len("[SYS_QUIZ_WRONG_CLICK:"):-1].strip())
+                except ValueError:
+                    clicked_idx = -1
+                quiz_now = teach_language.active_quiz
+                if (
+                    quiz_now
+                    and teach_language.quiz_stage == teach_language.STAGE_CHOICE
+                    and 0 <= clicked_idx < len(quiz_now.get("options", []))
+                ):
+                    lang_label = teach_language.LANGUAGE_NAMES.get(teach_language.target_lang, teach_language.target_lang)
+                    clicked_opt = quiz_now["options"][clicked_idx]
+                    _, corr_opt = teach_language.get_correct_option_info(quiz_now)
+                    wrong_prompt = (
+                        f"[STAGE 1 WRONG CHOICE FEEDBACK | Bahasa: {lang_label} | Level: {teach_language.user_level}]\n"
+                        f"Pertanyaan: \"{quiz_now.get('question', '')}\"\n"
+                        f"Pilihan SALAH yang diklik Zak: \"{clicked_opt.get('text', '')}\" ({clicked_opt.get('native', '')})\n"
+                        f"Info internal guru (JANGAN dibocorkan langsung kalimatnya): jawaban benar adalah \"{corr_opt.get('text', '')}\".\n"
+                        "Tugas: Jelaskan dalam 1 kalimat bahasa Indonesia yang singkat dan ramah (maks 22 kata) "
+                        "kenapa tata bahasa / pilihan kata pada opsi yang diklik Zak salah, lalu ajak Zak memilih opsi lain. "
+                        "Awali dengan [EMO:soft]. DILARANG menulis JSON atau membocorkan jawaban benar secara utuh."
+                    )
+                    speak_fast_coaching(
+                        wrong_prompt,
+                        default_emo="soft",
+                        fallback_msg="Pilihan itu struktur tata bahasanya masih kurang tepat, Zak. Coba pilih kartu jawaban lain ya!",
+                        max_tokens=140,
+                    )
+                continue
+
+            # 0C-2. Stage 1 -> Stage 2 (SPEAKING_STAGE): User mengklik opsi BENAR ->
+            # Pause 500ms, tampilkan 1 kartu jawaban benar, lalu berikan Grammar Breakdown + Pronunciation Guide + baca keras!
+            if user_input.startswith("[SYS_QUIZ_CORRECT_CLICK:"):
+                quiz_now = teach_language.active_quiz
+                if quiz_now:
+                    time.sleep(0.5)
+                    corr_opt = teach_language.enter_speaking_stage(bridge)
+                    corr_text = corr_opt.get("text", "")
+                    corr_native = corr_opt.get("native", corr_text)
+                    question_now = quiz_now.get("question", "")
+                    lang_label = teach_language.LANGUAGE_NAMES.get(teach_language.target_lang, teach_language.target_lang)
+
+                    # Highlight ikon speaker di kartu tunggal saat Tuzi menyampaikan contoh pengucapan
+                    if teach_language.ui_submode != "chat":
+                        bridge.quiz_state_signal.emit(json.dumps({
+                            "optionIndex": 0,
+                            "wordStates": [],
+                            "boxState": "",
+                            "highlightAssist": True,
+                        }))
+
+                    stage2_prompt = (
+                        f"[STAGE 2 COACHING — GRAMMAR & PRONUNCIATION | Bahasa: {lang_label} | Level: {teach_language.user_level}]\n"
+                        f"Pertanyaan awal: \"{question_now}\"\n"
+                        f"Jawaban BENAR yang dipilih Zak: \"{corr_text}\" (skrip asli: {corr_native})\n"
+                        "Tugas (abaikan batas 25 kata khusus sesi coaching ini, tulis 2-3 kalimat padat total 30-50 kata, 1 paragraf lurus):\n"
+                        "1. Puji singkat pilihan Zak yang benar untuk pertanyaan tersebut.\n"
+                        "2. GRAMMAR BREAKDOWN: Jelaskan singkat alasan struktur/partikel/tense pada kalimat itu tepat.\n"
+                        "3. PRONUNCIATION GUIDE: Beri 1 tips jelas cara melafalkan kata kunci / intonasinya.\n"
+                        f"4. Akhiri dengan membacakan kalimat target persis ini agar Zak menirukan: \"{corr_text}\"\n"
+                        "Awali dengan [EMO:excited]. DILARANG pakai emoji atau JSON."
+                    )
+                    speak_fast_coaching(
+                        stage2_prompt,
+                        default_emo="excited",
+                        fallback_msg=f"Tepat sekali, Zak! Struktur kalimat ini sudah benar. Sekarang tahan avatar dan ikuti cara bacaku: {corr_text}",
+                        required_sentence=corr_text,
+                        max_tokens=260,
+                    )
+                continue
+
             pending_quiz_question = None
 
-            # 0D. Memulai Kuis Pertama Sesuai Bahasa & Level Pilihan User (Batch Pre-Fetch 6 Soal)
+            # 0E-0. Abaikan sinyal [TEACH_UNCLEAR] liar bila tidak sedang di Stage 2 (SPEAKING_STAGE)
+            if user_input == "[TEACH_UNCLEAR]" and not (
+                teach_language.active_quiz
+                and teach_language.quiz_stage == teach_language.STAGE_SPEAKING
+                and teach_language.ui_submode == "live"
+            ):
+                presence.set_state("idle")
+                continue
+
+            # 0D. Memulai Kuis Pertama Sesuai Bahasa & Level Pilihan User (Stage 1: CHOICE_STAGE, Batch Pre-Fetch 6 Soal)
             if user_input.startswith("[SYS_ONBOARD_LEVEL:"):
                 chosen_lvl = user_input.replace("[SYS_ONBOARD_LEVEL:", "").replace("]", "").strip()
                 teach_language.user_level = chosen_lvl
@@ -1076,7 +1198,7 @@ def chat_processor_loop(bridge, tts_engine):
                 teach_language.ensure_quiz_batch_for_config(
                     teach_language.target_lang, chosen_lvl, custom_intelligence_prompt
                 )
-                # Pop soal pertama segera begitu siap & langsung render ke UI (0 ms delay jika sudah ter-buffer)
+                # Pop soal pertama segera begitu siap & langsung render ke Stage 1 UI (0 ms delay jika sudah ter-buffer)
                 first_quiz = teach_language.activate_first_quiz_when_ready(bridge, timeout=5.0)
                 pending_quiz_question = (first_quiz or {}).get("question", "")
                 if pending_quiz_question and teach_language.ui_submode != "chat":
@@ -1085,45 +1207,60 @@ def chat_processor_loop(bridge, tts_engine):
                 chat_history = [{"role": "system", "content": get_active_system_prompt()}]
                 user_input = (
                     f"[TEACH_INPUT] Aku siap mulai latihan {lang_label} level {chosen_lvl}. "
-                    f"Sapa aku maksimal 5 kata lalu ajukan pertanyaan pertama ini persis: \"{pending_quiz_question}\""
+                    f"Sapa aku maksimal 5 kata lalu ajukan pertanyaan pilihan ganda pertama ini persis: \"{pending_quiz_question}\""
                 )
 
-            # 0E. Evaluasi Duolingo Grammar & Speaking Saat Ada Kuis Pilihan Ganda yang Sedang Aktif
-            elif teach_language.active_quiz and teach_language.ui_submode == "live" and (
-                user_input.startswith("[TEACH_INPUT]") or user_input == "[TEACH_UNCLEAR]"
+            # 0E. Stage 2 (SPEAKING_STAGE): Evaluasi Pelafalan Suara-ke-Suara pada 1 Kartu Jawaban Benar
+            elif (
+                teach_language.active_quiz
+                and teach_language.quiz_stage == teach_language.STAGE_SPEAKING
+                and teach_language.ui_submode == "live"
+                and (user_input.startswith("[TEACH_INPUT]") or user_input == "[TEACH_UNCLEAR]")
             ):
                 spoken_attempt = (
                     "" if user_input == "[TEACH_UNCLEAR]" else user_input.replace("[TEACH_INPUT]", "").strip()
                 )
-                status, feedback_text, spoken_assist = teach_language.evaluate_quiz_attempt(
-                    spoken_attempt, bridge
-                )
+                eval_res = teach_language.evaluate_speaking_attempt(spoken_attempt, bridge)
+                status = eval_res["status"]
+                correct_text = eval_res["correct_text"]
+                correct_native = eval_res["correct_native"]
 
-                if status in ("PARTIAL", "UNCLEAR", "WRONG_GRAMMAR", "MISPRONOUNCED"):
-                    emo = "soft" if status in ("PARTIAL", "UNCLEAR") else "excited"
-                    bridge.expression_signal.emit(emo)
-                    with speech_lock:
-                        loop.run_until_complete(
-                            tts_engine.speak_with_lipsync(
-                                spoken_assist, emotion=emo, subtitle=feedback_text
-                            )
-                        )
-                    bridge.expression_signal.emit("natural")
-                    presence.set_state("idle")
+                if status in ("PARTIAL", "UNCLEAR", "MISPRONOUNCED"):
+                    # Tetap terkunci di SPEAKING_STAGE pada kalimat yang sama -> Re-explain pelafalan & grammar lalu baca ulang!
+                    lang_label = teach_language.LANGUAGE_NAMES.get(teach_language.target_lang, teach_language.target_lang)
+                    missed_str = ", ".join(eval_res.get("missed_words", [])) or correct_text
+                    detected_str = ", ".join(eval_res.get("detected_words", []))
+                    retry_prompt = (
+                        f"[STAGE 2 PRONUNCIATION RETRY COACHING | Bahasa: {lang_label} | Status: {status}]\n"
+                        f"Kalimat target: \"{correct_text}\" ({correct_native})\n"
+                        f"Yang terdengar dari Zak: \"{spoken_attempt or '(tidak terdengar jelas)'}\"\n"
+                        f"Kata yang sudah benar: \"{detected_str or 'belum ada'}\" | Kata yang terlewat/kurang pas: \"{missed_str}\"\n"
+                        "Tugas (2 kalimat ramah, total 22-40 kata, 1 baris):\n"
+                        "1. Semangati Zak, jelaskan ulang singkat cara melafalkan kata yang terlewat/kurang pas tersebut beserta pengingat grammar-nya.\n"
+                        f"2. Bacakan kembali kalimat lengkap \"{correct_text}\" agar Zak mengulanginya.\n"
+                        "Awali dengan [EMO:soft]. DILARANG pindah soal, DILARANG pakai emoji/JSON."
+                    )
+                    speak_fast_coaching(
+                        retry_prompt,
+                        default_emo="soft",
+                        fallback_msg=eval_res["spoken_assist"],
+                        required_sentence=correct_text,
+                        max_tokens=220,
+                    )
                     continue
 
                 elif status == "PASS":
-                    # Jawaban & Grammar 100% Benar (Semua Kata Biru!) ->
-                    # Langsung pop soal berikutnya dari quiz_buffer (0 ms, tanpa menunggu LLM)!
-                    time.sleep(0.35)
+                    # Pelafalan lulus (>= 82%, semua kata biru!) ->
+                    # Pop soal berikutnya dari quiz_buffer (0 ms) & reset ke Stage 1 (CHOICE_STAGE)!
+                    time.sleep(0.45)
                     next_quiz = teach_language.pop_next_quiz_and_emit(bridge)
                     pending_quiz_question = (next_quiz or {}).get("question", "")
                     if pending_quiz_question and teach_language.ui_submode != "chat":
                         bridge.subtitle_timed_signal.emit(pending_quiz_question, 0)
 
                     user_input = (
-                        f"[TEACH_INPUT] Aku baru saja mengucapkan '{feedback_text}' dengan benar! "
-                        f"Beri pujian 1 kalimat super singkat (maks 7 kata), lalu ajukan pertanyaan berikutnya ini persis: "
+                        f"[TEACH_INPUT] Pelafalanku untuk '{correct_text}' baru saja lulus 100%! "
+                        f"Beri pujian 1 kalimat super singkat (maks 7 kata), lalu ajukan pertanyaan pilihan ganda berikutnya ini persis: "
                         f"\"{pending_quiz_question}\""
                     )
 

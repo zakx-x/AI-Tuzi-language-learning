@@ -59,8 +59,12 @@ bridge_ref = None            # Diisi oleh run_tuzi.py untuk update warna kata re
 QUIZ_BATCH_SIZE = 6
 QUIZ_REFILL_THRESHOLD = 2
 ROMANIZED_LANGS = {"ja-JP", "ko-KR", "zh-CN"}
+STAGE_CHOICE = "CHOICE_STAGE"       # Stage 1: Pilih 1 dari 3 kartu dengan klik
+STAGE_SPEAKING = "SPEAKING_STAGE"   # Stage 2: Latihan pelafalan & coaching suara-ke-suara
 
 active_quiz = None
+quiz_stage = STAGE_CHOICE
+is_onboarding = True         # True selama layar pemilihan Bahasa/Level (blokir PTT Hold-to-Speak)
 quiz_turn_counter = 0
 quiz_buffer = collections.deque()            # Thread-safe batch pre-fetching queue (dikunci oleh quiz_buffer_lock)
 quiz_buffer_lock = threading.RLock()
@@ -305,9 +309,82 @@ def match_spoken_to_option(spoken_text: str, option_obj: dict) -> tuple[list[boo
     return matched_flags, word_match_ratio
 
 
-def compute_partial_quiz_state(quiz_obj: dict, partial_spoken: str):
-    """Menghitung payload JSON warna kata real-time (abu-abu -> biru) tanpa menyentuh UI."""
+def get_correct_option_info(quiz_obj: dict) -> tuple[int, dict]:
+    """Mengembalikan (index_opsi_benar, dict_opsi_benar) dari objek kuis aktif."""
+    if not quiz_obj or not quiz_obj.get("options"):
+        return 0, {}
+    options = quiz_obj["options"]
+    correct_idx = next((i for i, o in enumerate(options) if o.get("is_correct")), 0)
+    return correct_idx, options[correct_idx]
+
+
+def compute_choice_click_evaluation(quiz_obj: dict, clicked_idx: int) -> dict:
+    """
+    Stage 1 (CHOICE_STAGE): Mengevaluasi klik user pada salah satu dari 3 kartu pilihan ganda.
+    Pure Python (Capacitor-ready): mengembalikan hasil + payload state_update untuk UI.
+    """
+    if not quiz_obj or not quiz_obj.get("options"):
+        return {"valid": False}
+    options = quiz_obj["options"]
+    if not (0 <= clicked_idx < len(options)):
+        return {"valid": False}
+
+    clicked_opt = options[clicked_idx]
+    correct_idx, correct_opt = get_correct_option_info(quiz_obj)
+    clicked_words = [w for w in clicked_opt.get("text", "").split() if w.strip()]
+    is_correct = bool(clicked_opt.get("is_correct", False))
+
+    if is_correct:
+        return {
+            "valid": True,
+            "is_correct": True,
+            "optionIndex": clicked_idx,
+            "question": quiz_obj.get("question", ""),
+            "clicked_option": clicked_opt,
+            "correct_option": correct_opt,
+            "state_update": {
+                "optionIndex": clicked_idx,
+                "wordStates": ["blue"] * len(clicked_words),
+                "boxState": "blue",
+                "lockChoices": True,
+            },
+        }
+    return {
+        "valid": True,
+        "is_correct": False,
+        "optionIndex": clicked_idx,
+        "question": quiz_obj.get("question", ""),
+        "clicked_option": clicked_opt,
+        "correct_option": correct_opt,
+        "state_update": {
+            "optionIndex": clicked_idx,
+            "wordStates": ["wrong"] * len(clicked_words),
+            "boxState": "wrong",
+            "shake": True,
+            "disableTempMs": 1500,
+        },
+    }
+
+
+def compute_partial_quiz_state(quiz_obj: dict, partial_spoken: str, speaking_stage: bool = True):
+    """
+    Menghitung payload JSON warna kata real-time (abu-abu -> biru) tanpa menyentuh UI.
+    Di Stage 2 (SPEAKING_STAGE), UI hanya menampilkan 1 kartu jawaban benar pada DOM index 0.
+    """
     if not quiz_obj or not (partial_spoken or "").strip():
+        return None
+
+    if speaking_stage:
+        _, correct_opt = get_correct_option_info(quiz_obj)
+        if not correct_opt:
+            return None
+        flags, ratio = match_spoken_to_option(partial_spoken, correct_opt)
+        if ratio > 0.0:
+            return {
+                "optionIndex": 0,
+                "wordStates": ["blue" if m else "grey" for m in flags],
+                "boxState": "detecting",
+            }
         return None
 
     options = quiz_obj.get("options", [])
@@ -331,109 +408,166 @@ def compute_partial_quiz_state(quiz_obj: dict, partial_spoken: str):
     return None
 
 
-def compute_quiz_evaluation(quiz_obj: dict, spoken_text: str) -> dict:
+def compute_quiz_evaluation(quiz_obj: dict, spoken_text: str, speaking_stage: bool = True) -> dict:
     """
     Mengevaluasi bacaan user secara murni (tanpa dependensi PyQt/DOM) dan mengembalikan:
-      {"status": str, "feedback_text": str, "spoken_assist": str, "state_updates": list[dict]}
+      {
+        "status": "PASS" | "PARTIAL" | "UNCLEAR" | "MISPRONOUNCED" | "WRONG_GRAMMAR" | "NONE",
+        "feedback_text": str,
+        "spoken_assist": str,
+        "correct_text": str,
+        "correct_native": str,
+        "question": str,
+        "detected_words": list[str],
+        "missed_words": list[str],
+        "accuracy": float,
+        "state_updates": list[dict],
+      }
+    Di Stage 2 (SPEAKING_STAGE), hanya kartu jawaban benar yang dirender pada DOM index 0.
     """
+    empty_res = {
+        "status": "NONE",
+        "feedback_text": "",
+        "spoken_assist": "",
+        "correct_text": "",
+        "correct_native": "",
+        "question": "",
+        "detected_words": [],
+        "missed_words": [],
+        "accuracy": 0.0,
+        "state_updates": [],
+    }
     if not quiz_obj or not quiz_obj.get("options"):
-        return {"status": "NONE", "feedback_text": "", "spoken_assist": "", "state_updates": []}
+        return empty_res
 
     options = quiz_obj.get("options", [])
-    correct_idx = next((i for i, o in enumerate(options) if o.get("is_correct")), 0)
-    correct_opt = options[correct_idx]
-    correct_text = correct_opt["text"]
+    correct_idx, correct_opt = get_correct_option_info(quiz_obj)
+    ui_idx = 0 if speaking_stage else correct_idx
+    correct_text = correct_opt.get("text", "")
+    correct_native = correct_opt.get("native", correct_text)
+    question = quiz_obj.get("question", "")
     correct_words = [w for w in correct_text.split() if w.strip()]
+
+    base = {
+        "correct_text": correct_text,
+        "correct_native": correct_native,
+        "question": question,
+    }
 
     # 1. Suara kosong / tidak tertangkap -> Kuning (Minta baca ulang)
     if not spoken_text or not spoken_text.strip():
-        msg = "Suaramu belum terdengar jelas. Coba baca kembali kalimat yang berwarna kuning ya!"
+        msg = f"Suaramu belum terdengar jelas. Dengarkan dan coba ucapkan lagi: {correct_text}"
         return {
+            **base,
             "status": "UNCLEAR",
             "feedback_text": msg,
             "spoken_assist": msg,
+            "detected_words": [],
+            "missed_words": list(correct_words),
+            "accuracy": 0.0,
             "state_updates": [{
-                "optionIndex": correct_idx,
+                "optionIndex": ui_idx,
                 "wordStates": ["yellow"] * len(correct_words),
                 "boxState": "yellow",
+                "highlightAssist": True,
             }],
         }
 
     corr_flags, corr_ratio = match_spoken_to_option(spoken_text, correct_opt)
+    detected_words = [w for w, f in zip(correct_words, corr_flags) if f]
+    missed_words = [w for w, f in zip(correct_words, corr_flags) if not f]
 
-    best_wrong_idx = -1
-    best_wrong_ratio = 0.0
-    for idx, opt in enumerate(options):
-        if idx == correct_idx:
-            continue
-        _, w_ratio = match_spoken_to_option(spoken_text, opt)
-        if w_ratio > best_wrong_ratio:
-            best_wrong_ratio = w_ratio
-            best_wrong_idx = idx
+    # 2. (Khusus mode legacy multi-card) Cek jika user membaca opsi pengecoh
+    if not speaking_stage:
+        best_wrong_idx = -1
+        best_wrong_ratio = 0.0
+        for idx, opt in enumerate(options):
+            if idx == correct_idx:
+                continue
+            _, w_ratio = match_spoken_to_option(spoken_text, opt)
+            if w_ratio > best_wrong_ratio:
+                best_wrong_ratio = w_ratio
+                best_wrong_idx = idx
 
-    # 2. User membaca opsi dengan GRAMMAR SALAH -> Opsi salah merah, jawaban benar kuning + dibacakan AI
-    if best_wrong_ratio >= 0.65 and best_wrong_ratio > corr_ratio + 0.15:
-        wrong_words = options[best_wrong_idx]["text"].split()
-        assist_msg = f"Pilihan itu grammar-nya kurang tepat. Ikuti cara bacaku ya: {correct_text}"
-        return {
-            "status": "WRONG_GRAMMAR",
-            "feedback_text": assist_msg,
-            "spoken_assist": assist_msg,
-            "state_updates": [
-                {
-                    "optionIndex": best_wrong_idx,
-                    "wordStates": ["wrong"] * len(wrong_words),
-                    "boxState": "wrong",
-                },
-                {
-                    "optionIndex": correct_idx,
-                    "wordStates": ["yellow"] * len(correct_words),
-                    "boxState": "yellow",
-                    "highlightAssist": True,
-                },
-            ],
-        }
+        if best_wrong_ratio >= 0.65 and best_wrong_ratio > corr_ratio + 0.15:
+            wrong_words = options[best_wrong_idx]["text"].split()
+            assist_msg = f"Pilihan itu grammar-nya kurang tepat. Ikuti cara bacaku ya: {correct_text}"
+            return {
+                **base,
+                "status": "WRONG_GRAMMAR",
+                "feedback_text": assist_msg,
+                "spoken_assist": assist_msg,
+                "detected_words": detected_words,
+                "missed_words": missed_words,
+                "accuracy": corr_ratio,
+                "state_updates": [
+                    {
+                        "optionIndex": best_wrong_idx,
+                        "wordStates": ["wrong"] * len(wrong_words),
+                        "boxState": "wrong",
+                    },
+                    {
+                        "optionIndex": ui_idx,
+                        "wordStates": ["yellow"] * len(correct_words),
+                        "boxState": "yellow",
+                        "highlightAssist": True,
+                    },
+                ],
+            }
 
     # 3. >= 82% kata jawaban benar terdeteksi -> 100% BIRU (PASS!)
     if corr_ratio >= 0.82 or all(corr_flags):
         return {
+            **base,
             "status": "PASS",
             "feedback_text": correct_text,
             "spoken_assist": "",
+            "detected_words": list(correct_words),
+            "missed_words": [],
+            "accuracy": corr_ratio,
             "state_updates": [{
-                "optionIndex": correct_idx,
+                "optionIndex": ui_idx,
                 "wordStates": ["blue"] * len(correct_words),
                 "boxState": "blue",
             }],
         }
 
     # 4. Sebagian kata terdeteksi -> kata terbaca BIRU, sisanya KUNING
-    if sum(1 for f in corr_flags if f) >= 1:
+    if detected_words:
         word_states = ["blue" if f else "yellow" for f in corr_flags]
-        detected_words_str = " ".join(w for w, f in zip(correct_words, corr_flags) if f)
+        detected_words_str = " ".join(detected_words)
         retry_msg = (
-            f"Baru terdengar '{detected_words_str}'. "
-            f"Coba baca ulang kalimat lengkapnya yang berwarna kuning ya!"
+            f"Bagus, kata '{detected_words_str}' sudah terdengar! "
+            f"Coba ucapkan lagi bagian yang berwarna kuning: {correct_text}"
         )
         return {
+            **base,
             "status": "PARTIAL",
             "feedback_text": retry_msg,
             "spoken_assist": retry_msg,
+            "detected_words": detected_words,
+            "missed_words": missed_words,
+            "accuracy": corr_ratio,
             "state_updates": [{
-                "optionIndex": correct_idx,
+                "optionIndex": ui_idx,
                 "wordStates": word_states,
                 "boxState": "yellow",
+                "highlightAssist": True,
             }],
         }
 
-    # 5. Salah ucap total -> AI membantu membacakan
+    # 5. Salah ucap total -> semua kata KUNING + AI membantu membacakan
     assist_msg = f"Pelafalannya belum pas. Dengarkan dan ikuti cara bacaku ya: {correct_text}"
     return {
+        **base,
         "status": "MISPRONOUNCED",
         "feedback_text": assist_msg,
         "spoken_assist": assist_msg,
+        "detected_words": [],
+        "missed_words": list(correct_words),
+        "accuracy": corr_ratio,
         "state_updates": [{
-            "optionIndex": correct_idx,
+            "optionIndex": ui_idx,
             "wordStates": ["yellow"] * len(correct_words),
             "boxState": "yellow",
             "highlightAssist": True,
@@ -629,21 +763,50 @@ def get_fallback_quiz_batch(lang_code: str = None, count: int = QUIZ_BATCH_SIZE)
 # ==============================================================================
 # LAYER B: THREAD-SAFE QUIZ BUFFER PRODUCER & DESKTOP BRIDGE ADAPTER
 # ==============================================================================
-def emit_quiz_options(bridge, quiz_obj: dict):
-    """Mengirim payload kuis bersih ke frontend via signal JSON."""
+def emit_quiz_options(bridge, quiz_obj: dict, stage: str = STAGE_CHOICE):
+    """Mengirim payload kuis bersih ke frontend via signal JSON (Stage 1: 3 kartu klik, Stage 2: 1 kartu suara)."""
     target_bridge = bridge or bridge_ref
     if not target_bridge or not quiz_obj:
         return
-    payload = {
-        "question": quiz_obj.get("question", ""),
-        "options": quiz_obj.get("options", []),
-    }
+
+    if stage == STAGE_SPEAKING:
+        correct_idx, correct_opt = get_correct_option_info(quiz_obj)
+        payload = {
+            "stage": STAGE_SPEAKING,
+            "question": quiz_obj.get("question", ""),
+            "hint": "Hold avatar to pronounce",
+            "correctIndex": correct_idx,
+            "options": [correct_opt] if correct_opt else [],
+        }
+    else:
+        payload = {
+            "stage": STAGE_CHOICE,
+            "question": quiz_obj.get("question", ""),
+            "options": quiz_obj.get("options", []),
+        }
     target_bridge.quiz_options_signal.emit(json.dumps(payload, ensure_ascii=False))
+
+
+def enter_speaking_stage(bridge) -> dict:
+    """
+    Transisi dari Stage 1 (CHOICE_STAGE) -> Stage 2 (SPEAKING_STAGE) untuk soal aktif:
+    menyembunyikan pengecoh dan hanya menampilkan 1 kartu jawaban benar dengan kata abu-abu.
+    """
+    global quiz_stage
+    with quiz_buffer_lock:
+        quiz_stage = STAGE_SPEAKING
+        quiz_obj = active_quiz
+    if not quiz_obj:
+        return {}
+    if ui_submode != "chat":
+        emit_quiz_options(bridge, quiz_obj, stage=STAGE_SPEAKING)
+    _, correct_opt = get_correct_option_info(quiz_obj)
+    return correct_opt
 
 
 def _quiz_producer_worker(epoch: int, lang_code: str, level_name: str, persona_text: str, avoid_snapshot: list):
     """Background producer thread: memanggil QUIZ_GEN_MODEL untuk mengisi quiz_buffer (6 soal)."""
-    global active_quiz, _inflight_epoch, _pending_first_emit_bridge
+    global active_quiz, quiz_stage, is_onboarding, _inflight_epoch, _pending_first_emit_bridge
     t0 = time.perf_counter()
     fetched = []
     source = "QUIZ_GEN_MODEL"
@@ -679,12 +842,14 @@ def _quiz_producer_worker(epoch: int, lang_code: str, level_name: str, persona_t
         _inflight_epoch = None
         quiz_buffer.extend(fetched)
 
-        # Jika UI sedang menunggu soal pertama (ONBOARD:LEVEL), langsung pop & emit (0 ms delay!)
+        # Jika UI sedang menunggu soal pertama (ONBOARD:LEVEL), langsung pop & emit ke Stage 1 (0 ms delay!)
         if _pending_first_emit_bridge is not None and active_quiz is None and quiz_buffer:
             immediate_bridge = _pending_first_emit_bridge
             _pending_first_emit_bridge = None
             immediate_quiz = quiz_buffer.popleft()
             active_quiz = immediate_quiz
+            quiz_stage = STAGE_CHOICE
+            is_onboarding = False
             _recent_questions.append(immediate_quiz.get("question", ""))
 
         buf_len = len(quiz_buffer)
@@ -695,7 +860,7 @@ def _quiz_producer_worker(epoch: int, lang_code: str, level_name: str, persona_t
 
     if immediate_bridge is not None and immediate_quiz is not None:
         if ui_submode != "chat":
-            emit_quiz_options(immediate_bridge, immediate_quiz)
+            emit_quiz_options(immediate_bridge, immediate_quiz, stage=STAGE_CHOICE)
 
 
 def refill_quiz_buffer_async(
@@ -751,10 +916,11 @@ def ensure_quiz_batch_for_config(lang_code: str, level_name: str, persona_text: 
       di-generate (misal hasil pre-fetch saat pilih bahasa), langsung gunakan tanpa membuangnya.
     - Jika berbeda atau kosong, bersihkan quiz_buffer dan mulai batch 6 soal baru.
     """
-    global active_quiz
+    global active_quiz, quiz_stage
     cfg = (lang_code, level_name, persona_text or "")
     with quiz_buffer_lock:
         active_quiz = None
+        quiz_stage = STAGE_CHOICE
         if _buffer_config == cfg and (len(quiz_buffer) > 0 or _inflight_epoch == _quiz_epoch):
             if len(quiz_buffer) > 0:
                 quiz_ready_event.set()
@@ -764,26 +930,29 @@ def ensure_quiz_batch_for_config(lang_code: str, level_name: str, persona_text: 
 
 def activate_first_quiz_when_ready(bridge, timeout: float = 4.5) -> dict:
     """
-    Mengambil soal pertama untuk sesi baru:
+    Mengambil soal pertama untuk sesi baru dalam Stage 1 (CHOICE_STAGE):
     - Jika quiz_buffer sudah berisi soal -> pop & emit dalam 0 ms!
     - Jika producer masih berjalan -> pasang callback agar producer langsung emit begitu selesai (0 ms),
       dan tunggu hingga timeout sebelum jatuh ke FALLBACK_QUIZ_BANK.
     """
-    global active_quiz, _pending_first_emit_bridge
+    global active_quiz, quiz_stage, is_onboarding, _pending_first_emit_bridge
     immediate = None
     with quiz_buffer_lock:
         if active_quiz is not None:
             immediate = active_quiz
+            is_onboarding = False
         elif quiz_buffer:
             immediate = quiz_buffer.popleft()
             active_quiz = immediate
+            quiz_stage = STAGE_CHOICE
+            is_onboarding = False
             _recent_questions.append(immediate.get("question", ""))
         else:
             _pending_first_emit_bridge = bridge
 
     if immediate is not None:
         if ui_submode != "chat":
-            emit_quiz_options(bridge, immediate)
+            emit_quiz_options(bridge, immediate, stage=STAGE_CHOICE)
         _check_and_trigger_refill()
         return immediate
 
@@ -794,19 +963,24 @@ def activate_first_quiz_when_ready(bridge, timeout: float = 4.5) -> dict:
         _pending_first_emit_bridge = None
         if active_quiz is not None:
             quiz_obj = active_quiz
+            is_onboarding = False
         elif quiz_buffer:
             quiz_obj = quiz_buffer.popleft()
             active_quiz = quiz_obj
+            quiz_stage = STAGE_CHOICE
+            is_onboarding = False
             _recent_questions.append(quiz_obj.get("question", ""))
-            fallback_used = True  # Perlu di-emit di bawah karena belum sempat di-emit producer
+            fallback_used = True
         else:
             quiz_obj = get_fallback_quiz(target_lang)
             active_quiz = quiz_obj
+            quiz_stage = STAGE_CHOICE
+            is_onboarding = False
             _recent_questions.append(quiz_obj.get("question", ""))
             fallback_used = True
 
     if fallback_used and ui_submode != "chat":
-        emit_quiz_options(bridge, quiz_obj)
+        emit_quiz_options(bridge, quiz_obj, stage=STAGE_CHOICE)
     _check_and_trigger_refill()
     return quiz_obj
 
@@ -821,21 +995,23 @@ def _check_and_trigger_refill():
 
 def pop_next_quiz_and_emit(bridge) -> dict:
     """
-    Dipanggil instan saat status == 'PASS':
+    Dipanggil instan saat Stage 2 status == 'PASS':
     Langsung pop soal berikutnya dari quiz_buffer (0 ms, tanpa menunggu panggilan LLM),
-    emit quiz_options_signal ke UI, dan otomatis refill di background bila len(quiz_buffer) <= 2.
+    reset ke Stage 1 (CHOICE_STAGE), emit quiz_options_signal ke UI, dan otomatis refill
+    di background bila len(quiz_buffer) <= 2.
     """
-    global active_quiz
+    global active_quiz, quiz_stage
     with quiz_buffer_lock:
         if quiz_buffer:
             next_quiz = quiz_buffer.popleft()
         else:
             next_quiz = get_fallback_quiz(target_lang)
         active_quiz = next_quiz
+        quiz_stage = STAGE_CHOICE
         _recent_questions.append(next_quiz.get("question", ""))
 
     if ui_submode != "chat":
-        emit_quiz_options(bridge, next_quiz)
+        emit_quiz_options(bridge, next_quiz, stage=STAGE_CHOICE)
     _check_and_trigger_refill()
     return next_quiz
 
@@ -846,20 +1022,26 @@ def build_quiz_from_llm_or_fallback(raw_llm_output: str = "") -> dict:
 
 
 def update_live_partial_quiz_ui(partial_spoken: str):
-    """Mengubah warna kata dari Abu-abu menjadi Biru secara real-time saat user berbicara."""
-    if not active_quiz or not bridge_ref or not partial_spoken.strip():
+    """Mengubah warna kata dari Abu-abu menjadi Biru secara real-time saat user berbicara di Stage 2."""
+    if not active_quiz or quiz_stage != STAGE_SPEAKING or not bridge_ref or not partial_spoken.strip():
         return
-    payload = compute_partial_quiz_state(active_quiz, partial_spoken)
+    payload = compute_partial_quiz_state(active_quiz, partial_spoken, speaking_stage=True)
     if payload is not None:
         bridge_ref.quiz_state_signal.emit(json.dumps(payload))
 
 
-def evaluate_quiz_attempt(spoken_text: str, bridge) -> tuple[str, str, str]:
-    """Adapter evaluasi kuis: menjalankan evaluasi murni lalu mengirim state warna ke bridge UI."""
-    eval_res = compute_quiz_evaluation(active_quiz, spoken_text)
+def evaluate_speaking_attempt(spoken_text: str, bridge) -> dict:
+    """Evaluasi pelafalan Stage 2 (SPEAKING_STAGE) + kirim state warna (biru/kuning) ke UI."""
+    eval_res = compute_quiz_evaluation(active_quiz, spoken_text, speaking_stage=(quiz_stage == STAGE_SPEAKING))
     if bridge is not None:
         for st in eval_res["state_updates"]:
             bridge.quiz_state_signal.emit(json.dumps(st))
+    return eval_res
+
+
+def evaluate_quiz_attempt(spoken_text: str, bridge) -> tuple[str, str, str]:
+    """Adapter kompatibilitas evaluasi kuis -> (status, feedback_text, spoken_assist)."""
+    eval_res = evaluate_speaking_attempt(spoken_text, bridge)
     return eval_res["status"], eval_res["feedback_text"], eval_res["spoken_assist"]
 
 
@@ -992,7 +1174,7 @@ class HoldToTalkRecorder:
         self._partial_lock = threading.Lock()
 
     def start_recording(self, payload="en-US"):
-        global target_lang, user_level, ui_submode, current_gender, current_female_mode, custom_personality, selected_mic_index, active_quiz
+        global target_lang, user_level, ui_submode, current_gender, current_female_mode, custom_personality, selected_mic_index, active_quiz, quiz_stage, is_onboarding
 
         # 1. Perintah Keluar Instan dari Tombol Hang-up Merah
         if payload == "CMD:EXIT":
@@ -1013,20 +1195,60 @@ class HoldToTalkRecorder:
         # 3. Perintah Tombol Volume (🔊) di Kiri Teks Pilihan Ganda -> Tuzi Membacakan Kalimat Tersebut
         if payload.startswith("READ_OPTION:"):
             try:
-                opt_idx = int(payload.split(":", 1)[1].strip())
-                if active_quiz and 0 <= opt_idx < len(active_quiz.get("options", [])):
-                    opt_text = active_quiz["options"][opt_idx]["text"]
-                    stop_all_voice_playback()
-                    if main_input_queue:
-                        main_input_queue.put(f"[SYS_READ_OPTION:{opt_idx}:{opt_text}]")
+                raw_idx = payload.split(":", 1)[1].strip()
+                if active_quiz and active_quiz.get("options"):
+                    if quiz_stage == STAGE_SPEAKING:
+                        corr_idx, corr_opt = get_correct_option_info(active_quiz)
+                        opt_idx = corr_idx
+                        opt_text = corr_opt.get("text", "")
+                    else:
+                        opt_idx = int(raw_idx)
+                        opt_text = (
+                            active_quiz["options"][opt_idx]["text"]
+                            if 0 <= opt_idx < len(active_quiz["options"])
+                            else ""
+                        )
+                    if opt_text:
+                        stop_all_voice_playback()
+                        if main_input_queue:
+                            main_input_queue.put(f"[SYS_READ_OPTION:{opt_idx}:{opt_text}]")
             except Exception as e:
                 print(f"[READ_OPTION Error] {e}")
+            return
+
+        # 3B. Stage 1 (CHOICE_STAGE): Klik Kartu Pilihan Ganda -> Evaluasi Instan (Salah=Merah+Penjelasan, Benar=Biru->Stage 2)
+        if payload.startswith("QUIZ_CLICK:"):
+            try:
+                opt_idx = int(payload.split(":", 1)[1].strip())
+                with quiz_buffer_lock:
+                    if not active_quiz or quiz_stage != STAGE_CHOICE:
+                        return
+                    click_res = compute_choice_click_evaluation(active_quiz, opt_idx)
+                    if not click_res.get("valid"):
+                        return
+                    if click_res["is_correct"]:
+                        # Kunci segera ke SPEAKING_STAGE agar klik ganda tidak memicu ulang Stage 1
+                        quiz_stage = STAGE_SPEAKING
+
+                stop_all_voice_playback()
+                if bridge_ref is not None:
+                    bridge_ref.quiz_state_signal.emit(json.dumps(click_res["state_update"]))
+
+                if main_input_queue:
+                    if click_res["is_correct"]:
+                        main_input_queue.put(f"[SYS_QUIZ_CORRECT_CLICK:{opt_idx}]")
+                    else:
+                        main_input_queue.put(f"[SYS_QUIZ_WRONG_CLICK:{opt_idx}]")
+            except Exception as e:
+                print(f"[QUIZ_CLICK Error] {e}")
             return
 
         # 4. Perintah Onboarding: Sapaan Awal -> Pilih Bahasa -> Pilih Level
         if payload == "ONBOARD:START":
             with quiz_buffer_lock:
                 active_quiz = None
+                quiz_stage = STAGE_CHOICE
+                is_onboarding = True
                 quiz_buffer.clear()
                 quiz_ready_event.clear()
             if main_input_queue:
@@ -1037,6 +1259,8 @@ class HoldToTalkRecorder:
             target_lang = chosen_lang
             self.lang = chosen_lang
             active_quiz = None
+            quiz_stage = STAGE_CHOICE
+            is_onboarding = True
             stop_all_voice_playback()
             # Pre-fetch lebih awal saat user memilih bahasa agar kuis siap saat level diklik
             refill_quiz_buffer_async(target_lang, user_level, custom_personality, clear_first=True)
@@ -1048,6 +1272,8 @@ class HoldToTalkRecorder:
             chosen_level = payload.split(":", 2)[2].strip()
             user_level = chosen_level
             active_quiz = None
+            quiz_stage = STAGE_CHOICE
+            is_onboarding = True
             stop_all_voice_playback()
             # Pastikan batch 6 soal sesuai bahasa + level terpilih (pakai hasil pre-fetch jika cocok, atau minta baru)
             ensure_quiz_batch_for_config(target_lang, user_level, custom_personality)
@@ -1126,8 +1352,12 @@ class HoldToTalkRecorder:
                 main_input_queue.put(f"[TEACH_INPUT] {chat_text}")
             return
 
-        # 11. Rekaman Suara Push-to-Talk pada Avatar Blob / Kotak Kuis (Mode Live)
+        # 11. Rekaman Suara Push-to-Talk pada Avatar Blob / Kotak Latihan (Mode Live)
+        # Blokir perekaman mikrofon selama Onboarding Bahasa/Level & Stage 1 (CHOICE_STAGE)
         if ui_submode == "chat" or self.is_recording:
+            return
+        if is_onboarding or (active_quiz is not None and quiz_stage == STAGE_CHOICE):
+            print("[TEACH MIC] Hold-to-speak dinonaktifkan selama Stage 1 (CHOICE_STAGE) / Onboarding.")
             return
         self.lang = payload
         target_lang = payload
@@ -1168,7 +1398,7 @@ class HoldToTalkRecorder:
         if not self._partial_lock.acquire(blocking=False):
             return
         try:
-            if not self.is_recording or not active_quiz:
+            if not self.is_recording or not active_quiz or quiz_stage != STAGE_SPEAKING:
                 return
             rms = audioop.rms(raw_snapshot, sample_width)
             if rms < 60:
@@ -1203,8 +1433,8 @@ class HoldToTalkRecorder:
                     self.frames.append(buffer)
                     chunk_counter += 1
 
-                    # Setiap ~0.75 detik saat menahan mic, cek kata yang sudah diucapkan agar berubah biru
-                    if self.is_recording and active_quiz and chunk_counter % 12 == 0:
+                    # Setiap ~0.75 detik saat menahan mic di Stage 2, cek kata yang diucapkan agar berubah biru
+                    if self.is_recording and active_quiz and quiz_stage == STAGE_SPEAKING and chunk_counter % 12 == 0:
                         snapshot = b"".join(self.frames)
                         threading.Thread(
                             target=self._run_live_partial_check,
@@ -1232,13 +1462,13 @@ class HoldToTalkRecorder:
                 main_input_queue.put(f"[TEACH_INPUT] {text.strip()}")
                 queued = True
                 _set_presence("thinking")
-            elif active_quiz and main_input_queue:
+            elif active_quiz and quiz_stage == STAGE_SPEAKING and main_input_queue:
                 main_input_queue.put("[TEACH_UNCLEAR]")
                 queued = True
 
         except sr.UnknownValueError:
             print("[TEACH MIC] Suara tidak terdengar jelas.")
-            if active_quiz and main_input_queue:
+            if active_quiz and quiz_stage == STAGE_SPEAKING and main_input_queue:
                 main_input_queue.put("[TEACH_UNCLEAR]")
                 queued = True
         except Exception as e:
@@ -1566,6 +1796,81 @@ def get_ui_injection_js() -> str:
                     border-color: #EF4444 !important;
                     box-shadow: 0 10px 26px rgba(239, 68, 68, 0.20) !important;
                 }
+                .tuzi-quiz-box.choice-shake {
+                    animation: quizShake 0.44s ease-in-out !important;
+                }
+                .tuzi-quiz-box.choice-disabled {
+                    opacity: 0.56 !important;
+                    pointer-events: none !important;
+                }
+                .tuzi-quiz-box.choice-card {
+                    padding: 12px 24px;
+                    justify-content: center;
+                    text-align: center;
+                }
+                .tuzi-quiz-box.speaking-card {
+                    max-width: 610px;
+                    min-height: 70px;
+                    padding: 15px 24px 15px 18px;
+                    cursor: grab;
+                }
+                .tuzi-quiz-box.speaking-card:active {
+                    cursor: grabbing;
+                }
+                @keyframes quizShake {
+                    0%, 100% { transform: translateX(0); }
+                    20% { transform: translateX(-8px); }
+                    40% { transform: translateX(8px); }
+                    60% { transform: translateX(-5px); }
+                    80% { transform: translateX(5px); }
+                }
+
+                /* Petunjuk Stage 2 (SPEAKING_STAGE): Hold avatar to pronounce */
+                .speaking-stage-hint {
+                    width: 100%;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    margin-top: 12px;
+                    pointer-events: none;
+                }
+                .speaking-stage-hint-pill {
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 8px;
+                    padding: 8px 18px;
+                    border-radius: 999px;
+                    background: rgba(59, 130, 246, 0.10);
+                    border: 1.5px solid rgba(59, 130, 246, 0.28);
+                    color: #2563EB;
+                    font-size: 13.5px;
+                    font-weight: 700;
+                    letter-spacing: 0.35px;
+                    animation: bubblePopUp 0.36s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+                }
+                body.female-avatar .speaking-stage-hint-pill {
+                    background: rgba(236, 72, 153, 0.10);
+                    border-color: rgba(236, 72, 153, 0.30);
+                    color: #DB2777;
+                }
+                body.teach-mode-active.dark-mode .tuzi-quiz-box {
+                    background: #0F0F12;
+                    border-color: rgba(255, 255, 255, 0.18);
+                    box-shadow: 0 10px 26px rgba(0, 0, 0, 0.55);
+                }
+                body.teach-mode-active.dark-mode .quiz-vol-btn {
+                    background: #1B1B20;
+                    border-color: rgba(255, 255, 255, 0.16);
+                    color: #D1D5DB;
+                }
+                body.teach-mode-active.dark-mode .quiz-word {
+                    color: #9CA3AF;
+                }
+                body.teach-mode-active.dark-mode .speaking-stage-hint-pill {
+                    background: rgba(236, 72, 153, 0.16);
+                    border-color: rgba(236, 72, 153, 0.42);
+                    color: #F472B6;
+                }
 
                 /* Tombol Logo Volume di Kiri Teks */
                 .quiz-vol-btn {
@@ -1609,7 +1914,10 @@ def get_ui_injection_js() -> str:
                     align-items: center;
                     justify-content: center;
                     text-align: center;
-                    padding-right: 26px; /* Penyeimbang agar teks tetap tepat di tengah kotak */
+                    padding-right: 0;
+                }
+                #tuzi-choice-container.speaking-stage .quiz-words-wrap {
+                    padding-right: 26px; /* Penyeimbang tombol volume kiri di Stage 2 agar teks tepat di tengah */
                 }
 
                 /* Setiap Kata di Dalam Kotak (Default: Abu-abu, Terdeteksi: Biru, Ulang: Kuning) */
@@ -1712,8 +2020,8 @@ def get_ui_injection_js() -> str:
 
                 #blob-ptt-hint {
                     margin-bottom: 12px; background: transparent; border: none;
-                    color: #6B7280; opacity: 0.55; font-size: 14px; font-weight: 600;
-                    letter-spacing: 0.8px; transition: all 0.25s ease; pointer-events: none;
+                    color: #6B7280; opacity: 0.55; visibility: visible; font-size: 14px; font-weight: 600;
+                    letter-spacing: 0.8px; transition: opacity 0.22s ease, visibility 0.22s ease, color 0.25s ease; pointer-events: none;
                 }
                 body.teach-mode-active.dark-mode #blob-ptt-hint { color: #A3A3A3; }
                 #ai-blob-stage.listening #blob-ptt-hint { color: #3F49CC; opacity: 0.9; }
@@ -2450,6 +2758,32 @@ def get_ui_injection_js() -> str:
             }
 
             let isQuizModeActive = false;
+            let currentQuizStage = 'CHOICE_STAGE';
+            let quizChoicesLocked = false;
+            let isHolding = false;
+            window.canHoldToSpeak = false;
+
+            function setHoldToSpeakEnabled(enabled) {
+                window.canHoldToSpeak = Boolean(enabled);
+                if (!window.canHoldToSpeak && isHolding) {
+                    stopHold();
+                }
+                if (pttHint) {
+                    if (window.canHoldToSpeak) {
+                        pttHint.style.visibility = 'visible';
+                        pttHint.style.opacity = '';
+                        if (!isHolding) {
+                            pttHint.innerText = 'hold to speak';
+                        }
+                    } else {
+                        pttHint.style.visibility = 'hidden';
+                        pttHint.style.opacity = '0';
+                    }
+                }
+                if (blobWrapper) {
+                    blobWrapper.style.cursor = window.canHoldToSpeak ? 'pointer' : 'default';
+                }
+            }
 
             let micSelect = document.getElementById('tuzi-mic-select');
             if (micSelect && AVAILABLE_MICS && AVAILABLE_MICS.length > 0) {
@@ -2517,6 +2851,7 @@ def get_ui_injection_js() -> str:
             function renderChoiceBoxes(items, onSelect) {
                 if (!choiceContainer) return;
                 isQuizModeActive = false;
+                setHoldToSpeakEnabled(false);
                 choiceContainer.innerHTML = '';
                 document.body.classList.add('choices-active');
                 choiceContainer.classList.add('show');
@@ -2535,13 +2870,16 @@ def get_ui_injection_js() -> str:
                 });
             }
 
-            function hideChoiceBoxes() {
+            function hideChoiceBoxes(enablePtt = true) {
                 isQuizModeActive = false;
+                currentQuizStage = 'CHOICE_STAGE';
+                quizChoicesLocked = false;
                 if (choiceContainer) {
-                    choiceContainer.classList.remove('show');
+                    choiceContainer.classList.remove('show', 'choice-stage', 'speaking-stage');
                     choiceContainer.innerHTML = '';
                 }
                 document.body.classList.remove('choices-active');
+                setHoldToSpeakEnabled(enablePtt);
             }
 
             // === AUTO-LAYOUT: SUBTITLE & KOTAK JAWABAN TIDAK BOLEH TUMPANG TINDIH ===
@@ -2634,41 +2972,46 @@ def get_ui_injection_js() -> str:
             }).observe(document.body, { attributes: true, attributeFilter: ['class'], childList: true });
             window.addEventListener('resize', scheduleChoiceLayout);
 
-            // Render Kuis Pilihan Ganda Grammar & Speaking (Logo Volume di Kiri + Kata Abu-abu di Tengah)
+            const MIC_HINT_SVG = `
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                    <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                    <line x1="12" y1="19" x2="12" y2="23"></line>
+                    <line x1="8" y1="23" x2="16" y2="23"></line>
+                </svg>
+            `;
+
+            // Render Kuis Dua Tahap:
+            // - CHOICE_STAGE  : 3 kartu pilihan ganda klik standar (TANPA ikon volume & hold-to-speak dinonaktifkan)
+            // - SPEAKING_STAGE: 1 kartu jawaban benar di tengah DENGAN tombol volume kiri + hold-to-speak aktif
             window.renderGrammarQuiz = function(quizDataJson) {
                 if (!choiceContainer) return;
                 let data = typeof quizDataJson === 'string' ? JSON.parse(quizDataJson) : quizDataJson;
                 let options = data.options || [];
                 if (!options.length) return;
 
+                let stage = data.stage || 'CHOICE_STAGE';
+                let isSpeakingStage = (stage === 'SPEAKING_STAGE');
+
                 isQuizModeActive = true;
+                currentQuizStage = stage;
+                quizChoicesLocked = false;
                 choiceContainer.innerHTML = '';
                 document.body.classList.add('choices-active');
                 choiceContainer.classList.add('show');
+                choiceContainer.classList.toggle('speaking-stage', isSpeakingStage);
+                choiceContainer.classList.toggle('choice-stage', !isSpeakingStage);
+
+                // Kunci Hold-to-Speak di Stage 1 (CHOICE_STAGE); aktifkan kembali di Stage 2 (SPEAKING_STAGE)
+                setHoldToSpeakEnabled(isSpeakingStage);
 
                 options.forEach((opt, optIdx) => {
                     let box = document.createElement('div');
-                    box.className = 'tuzi-quiz-box';
+                    box.className = isSpeakingStage ? 'tuzi-quiz-box speaking-card' : 'tuzi-quiz-box choice-card';
                     box.id = 'quiz-box-' + optIdx;
                     box.style.animationDelay = (optIdx * 0.065) + 's';
 
-                    // Tombol Volume di sebelah kiri teks
-                    let volBtn = document.createElement('button');
-                    volBtn.className = 'quiz-vol-btn';
-                    volBtn.id = 'quiz-vol-' + optIdx;
-                    volBtn.title = 'Dengarkan cara pengucapan kalimat ini';
-                    volBtn.innerHTML = VOLUME_SVG;
-                    volBtn.onclick = (e) => {
-                        e.stopPropagation();
-                        volBtn.classList.add('playing');
-                        setTimeout(() => volBtn.classList.remove('playing'), 2200);
-                        if (window.pyBridge) {
-                            window.pyBridge.start_ptt('READ_OPTION:' + optIdx);
-                        }
-                    };
-                    volBtn.onmousedown = (e) => e.stopPropagation();
-
-                    // Teks kalimat di tengah kotak (tiap kata dibungkus span .quiz-word)
+                    // Teks kalimat di tengah kotak (tiap kata dibungkus span .quiz-word default abu-abu)
                     let wordsWrap = document.createElement('div');
                     wordsWrap.className = 'quiz-words-wrap';
                     let words = (opt.text || '').trim().split(/\s+/);
@@ -2680,16 +3023,56 @@ def get_ui_injection_js() -> str:
                         wordsWrap.appendChild(span);
                     });
 
-                    // User juga bisa menahan langsung kotak jawaban untuk berbicara
-                    box.addEventListener('mousedown', startHold);
+                    if (isSpeakingStage) {
+                        // Stage 2: Tampilkan tombol Volume di kiri kartu target + aktifkan tahan kartu / avatar untuk berbicara
+                        let volBtn = document.createElement('button');
+                        volBtn.className = 'quiz-vol-btn';
+                        volBtn.id = 'quiz-vol-' + optIdx;
+                        volBtn.type = 'button';
+                        volBtn.title = 'Dengarkan cara pengucapan kalimat ini';
+                        volBtn.innerHTML = VOLUME_SVG;
+                        volBtn.onclick = (e) => {
+                            e.stopPropagation();
+                            volBtn.classList.add('playing');
+                            setTimeout(() => volBtn.classList.remove('playing'), 2200);
+                            if (window.pyBridge) {
+                                let readTarget = data.correctIndex !== undefined ? data.correctIndex : optIdx;
+                                window.pyBridge.start_ptt('READ_OPTION:' + readTarget);
+                            }
+                        };
+                        volBtn.onmousedown = (e) => e.stopPropagation();
 
-                    box.appendChild(volBtn);
-                    box.appendChild(wordsWrap);
+                        box.addEventListener('mousedown', startHold);
+                        box.appendChild(volBtn);
+                        box.appendChild(wordsWrap);
+                    } else {
+                        // Stage 1: Kartu pilihan ganda bersih tanpa tombol volume (klik kirim QUIZ_CLICK:<idx>)
+                        box.onclick = () => {
+                            if (quizChoicesLocked || box.classList.contains('choice-disabled')) return;
+                            if (window.pyBridge) {
+                                window.pyBridge.start_ptt('QUIZ_CLICK:' + optIdx);
+                            }
+                        };
+                        box.appendChild(wordsWrap);
+                    }
+
                     choiceContainer.appendChild(box);
                 });
+
+                if (isSpeakingStage) {
+                    let hintRow = document.createElement('div');
+                    hintRow.className = 'speaking-stage-hint';
+                    let pill = document.createElement('div');
+                    pill.className = 'speaking-stage-hint-pill';
+                    pill.innerHTML = MIC_HINT_SVG + `<span>${data.hint || 'Hold avatar to pronounce'}</span>`;
+                    hintRow.appendChild(pill);
+                    choiceContainer.appendChild(hintRow);
+                }
+
+                scheduleChoiceLayout();
             };
 
-            // Update Warna Kata (Abu-abu -> Biru saat terdeteksi / Kuning saat diminta ulang)
+            // Update Warna Kata & Efek Klik (Stage 1: merah+shake / biru; Stage 2: biru live / kuning retry)
             window.updateGrammarQuizState = function(stateJson) {
                 let st = typeof stateJson === 'string' ? JSON.parse(stateJson) : stateJson;
                 let optIdx = st.optionIndex;
@@ -2699,9 +3082,27 @@ def get_ui_injection_js() -> str:
                 let box = document.getElementById('quiz-box-' + optIdx);
                 if (!box) return;
 
+                if (st.lockChoices) {
+                    quizChoicesLocked = true;
+                }
+
                 box.classList.remove('state-detecting', 'state-blue', 'state-yellow', 'state-wrong');
                 if (boxState) {
                     box.classList.add('state-' + boxState);
+                }
+
+                if (st.shake) {
+                    box.classList.remove('choice-shake');
+                    void box.offsetWidth;
+                    box.classList.add('choice-shake');
+                    setTimeout(() => box.classList.remove('choice-shake'), 480);
+                }
+
+                if (st.disableTempMs && st.disableTempMs > 0) {
+                    box.classList.add('choice-disabled');
+                    setTimeout(() => {
+                        if (box) box.classList.remove('choice-disabled');
+                    }, st.disableTempMs);
                 }
 
                 if (st.highlightAssist) {
@@ -2734,7 +3135,7 @@ def get_ui_injection_js() -> str:
 
             window.showLevelOnboarding = function() {
                 renderChoiceBoxes(LEVEL_CHOICES, (selected) => {
-                    hideChoiceBoxes();
+                    hideChoiceBoxes(false);
                     if (window.pyBridge) {
                         window.pyBridge.start_ptt('ONBOARD:LEVEL:' + selected.level);
                     }
@@ -2873,7 +3274,6 @@ def get_ui_injection_js() -> str:
             }
 
             // 5. ANIMASI AVATAR BLOB & PUSH-TO-TALK
-            let isHolding = false;
             let bubbleTimer = null;
 
             if (blobEyes) {
@@ -2927,11 +3327,12 @@ def get_ui_injection_js() -> str:
             };
 
             function startHold(e) {
+                if (!window.canHoldToSpeak) return;
                 e.preventDefault();
                 if (isHolding || document.body.classList.contains('chat-tab-open')) return;
-                // Jangan sembunyikan kotak jika sedang berada di mode Kuis Pilihan Ganda!
+                // Jangan sembunyikan kotak jika sedang berada di mode Kuis!
                 if (!isQuizModeActive) {
-                    hideChoiceBoxes();
+                    hideChoiceBoxes(true);
                 }
                 isHolding = true;
                 if (blobWrapper) blobWrapper.classList.add('listening');
@@ -2949,7 +3350,9 @@ def get_ui_injection_js() -> str:
                 clearInterval(bubbleTimer);
                 if (blobWrapper) blobWrapper.classList.remove('listening');
                 if (blobStage) blobStage.classList.remove('listening');
-                if (pttHint) pttHint.innerText = 'hold to speak';
+                if (pttHint && window.canHoldToSpeak) {
+                    pttHint.innerText = 'hold to speak';
+                }
                 if (window.pyBridge) window.pyBridge.stop_ptt();
             }
 
