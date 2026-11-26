@@ -1914,6 +1914,7 @@ def get_ui_injection_js() -> str:
                     align-items: center;
                     justify-content: center;
                     text-align: center;
+                    gap: 0;
                     padding-right: 0;
                 }
                 #tuzi-choice-container.speaking-stage .quiz-words-wrap {
@@ -1923,7 +1924,8 @@ def get_ui_injection_js() -> str:
                 /* Setiap Kata di Dalam Kotak (Default: Abu-abu, Terdeteksi: Biru, Ulang: Kuning) */
                 .quiz-word {
                     display: inline-block;
-                    margin: 2px 4.5px;
+                    margin: 2px 2px;
+                    letter-spacing: normal;
                     color: #6B7280; /* Default Abu-abu */
                     font-size: 16.5px;
                     font-weight: 600;
@@ -3011,10 +3013,10 @@ def get_ui_injection_js() -> str:
                     box.id = 'quiz-box-' + optIdx;
                     box.style.animationDelay = (optIdx * 0.065) + 's';
 
-                    // Teks kalimat di tengah kotak (tiap kata dibungkus span .quiz-word default abu-abu)
+                    // Teks kalimat di tengah kotak (tiap kata dibungkus span .quiz-word tanpa spasi text node ekstra)
                     let wordsWrap = document.createElement('div');
                     wordsWrap.className = 'quiz-words-wrap';
-                    let words = (opt.text || '').trim().split(/\s+/);
+                    let words = (opt.text || '').trim().split(/\s+/).filter(Boolean);
                     words.forEach((w, wIdx) => {
                         let span = document.createElement('span');
                         span.className = 'quiz-word';

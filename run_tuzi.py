@@ -21,6 +21,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import pygame
 import edge_tts
+from elevenlabs import VoiceSettings
 from elevenlabs.client import ElevenLabs
 from openai import (
     OpenAI,
@@ -455,21 +456,51 @@ class TransparentAvatarWindow(QMainWindow):
 
 
 class ElevenLabsTTSEngine:
-    STREAM_SAMPLE_RATE = 24000  # pcm_24000 = 24kHz S16LE mono (tersedia di semua tier ElevenLabs)
-    FALLBACK_MODELS = ("eleven_flash_v2_5", "eleven_turbo_v2_5", "eleven_multilingual_v2")
+    STREAM_SAMPLE_RATE = 24000  # pcm_24000 = 24kHz S16LE mono uncompressed (native rate ElevenLabs)
+    MP3_OUTPUT_FORMAT = "mp3_44100_128"  # 44.1kHz 128kbps jernih (gantikan mp3_22050_32 yang mendem)
+    FALLBACK_MODELS = ("eleven_turbo_v2_5", "eleven_multilingual_v2", "eleven_flash_v2_5")
 
     def __init__(self, bridge):
         self.bridge = bridge
         self.voice_cfg = getattr(config, "VoiceConfig", None)
         self.api_key = getattr(self.voice_cfg, "API_KEY", getattr(config, "ELEVENLABS_API_KEY", ""))
-        self.model_id = getattr(self.voice_cfg, "MODEL_ID", "eleven_flash_v2_5")
+        self.model_id = getattr(
+            self.voice_cfg,
+            "MODEL_ID",
+            getattr(config, "ELEVENLABS_MODEL_ID", "eleven_v4_turbo"),
+        )
         self.client = ElevenLabs(api_key=self.api_key)
+        self._pcm_supported = True  # Otomatis False jika tier ElevenLabs tidak mengizinkan output PCM
 
         self.current_gender = "female"
         self.current_mode = 1
         self.voice_id = ""
         self.set_voice("female", 1)
-        pygame.mixer.init()
+        self._ensure_mixer(44100, 2)
+
+    @staticmethod
+    def _ensure_mixer(frequency: int = 44100, channels: int = 2):
+        """Pastikan pygame.mixer berjalan di sample rate native audio (0 resampling kasar audioop.ratecv)."""
+        cur = pygame.mixer.get_init()
+        if cur and cur[0] == frequency and cur[1] == -16 and cur[2] == channels:
+            return
+        try:
+            if cur:
+                pygame.mixer.quit()
+            pygame.mixer.init(frequency=frequency, size=-16, channels=channels, buffer=512)
+        except Exception:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
+
+    @staticmethod
+    def _build_voice_settings(emotion: str = "natural") -> VoiceSettings:
+        """Pengaturan kejernihan & prosodi vokal ElevenLabs agar suara lebih jernih dan realistis."""
+        emo = (emotion or "natural").lower()
+        if emo == "excited":
+            return VoiceSettings(stability=0.42, similarity_boost=0.82, style=0.22, use_speaker_boost=True)
+        if emo == "soft":
+            return VoiceSettings(stability=0.52, similarity_boost=0.80, style=0.10, use_speaker_boost=True)
+        return VoiceSettings(stability=0.46, similarity_boost=0.82, style=0.14, use_speaker_boost=True)
 
     def set_voice(self, gender: str = "female", mode: int = 1):
         self.current_gender = gender.lower()
@@ -533,10 +564,12 @@ class ElevenLabsTTSEngine:
             print(f"\n[ERROR Edge TTS] Gagal mengatur voice fallback: {e2}")
             return None
 
-    async def render_audio(self, text: str):
-        """Menulis chunk streaming MP3 secara progresif ke file sementara (dengan fallback edge-tts)."""
+    async def render_audio(self, text: str, emotion: str = "natural"):
+        """Menulis chunk streaming MP3 44.1kHz 128kbps secara progresif ke file sementara (dengan fallback edge-tts)."""
         if not self._has_valid_api_key():
             return await self._render_edge_tts_mp3(text)
+
+        voice_settings = self._build_voice_settings(emotion)
 
         def _stream_mp3_to_temp():
             last_exc = None
@@ -547,7 +580,8 @@ class ElevenLabsTTSEngine:
                         voice_id=self.voice_id,
                         model_id=candidate_model,
                         text=text,
-                        output_format="mp3_22050_32",
+                        output_format=self.MP3_OUTPUT_FORMAT,
+                        voice_settings=voice_settings,
                     )
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
                         tmp_path = fp.name
@@ -561,6 +595,7 @@ class ElevenLabsTTSEngine:
                                 wrote_any = True
                     if wrote_any:
                         if candidate_model != self.model_id:
+                            print(f"[ElevenLabs] Model aktif dialihkan ke: {candidate_model}")
                             self.model_id = candidate_model
                         return tmp_path
                     if tmp_path and os.path.exists(tmp_path):
@@ -588,6 +623,7 @@ class ElevenLabsTTSEngine:
         return await self._render_edge_tts_mp3(text)
 
     async def _play_mp3_file_with_lipsync(self, tmp_path: str, subtitle: str = ""):
+        self._ensure_mixer(44100, 2)
         duration_ms = 0
         try:
             duration_ms = int(pygame.mixer.Sound(tmp_path).get_length() * 1000)
@@ -621,20 +657,19 @@ class ElevenLabsTTSEngine:
         except Exception:
             pass
 
-    async def _stream_pcm_with_lipsync(self, text: str, subtitle: str = "") -> bool:
+    async def _stream_pcm_with_lipsync(self, text: str, emotion: str = "natural", subtitle: str = "") -> bool:
         """
         Streaming langsung via self.client.text_to_speech.stream(..., output_format='pcm_24000')
-        ke pygame.mixer.Channel sehingga suara mulai diputar begitu ~160ms chunk pertama tiba
-        (tanpa menunggu seluruh kalimat selesai diunduh). Mengembalikan True jika berhasil.
+        pada sample rate native 24kHz mono (TANPA resampling linear audioop.ratecv) sehingga suara
+        jernih, realistis, dan mulai diputar ~160ms setelah chunk pertama tiba.
         """
-        if not self._has_valid_api_key():
+        if not self._has_valid_api_key() or not self._pcm_supported:
             return False
 
+        self._ensure_mixer(self.STREAM_SAMPLE_RATE, 1)
         mixer_init = pygame.mixer.get_init()
-        if not mixer_init:
-            pygame.mixer.init()
-            mixer_init = pygame.mixer.get_init()
         mixer_freq, _, mixer_chans = mixer_init
+        voice_settings = self._build_voice_settings(emotion)
 
         chunk_queue = collections.deque()
         queue_lock = threading.Lock()
@@ -658,6 +693,7 @@ class ElevenLabsTTSEngine:
                         model_id=candidate_model,
                         text=text,
                         output_format="pcm_24000",
+                        voice_settings=voice_settings,
                     )
                     for raw_chunk in stream_iter:
                         if abort_flag.is_set() or teach_language.voice_interrupt_event.is_set():
@@ -676,6 +712,7 @@ class ElevenLabsTTSEngine:
                         rms = audioop.rms(pcm_mono, 2)
                         mouth_val = 0.08 if rms < 180 else min(0.92, max(0.16, rms / 5200.0))
 
+                        # Native 24kHz mono -> ZERO resampling; hanya fallback bila device memaksa rate lain
                         if mixer_freq != self.STREAM_SAMPLE_RATE:
                             resampled, rate_state = audioop.ratecv(
                                 pcm_mono, 2, 1, self.STREAM_SAMPLE_RATE, mixer_freq, rate_state
@@ -692,14 +729,17 @@ class ElevenLabsTTSEngine:
 
                     if state["got_any_audio"]:
                         if candidate_model != self.model_id:
-                            print(f"[ElevenLabs] Model dialihkan ke model streaming cepat: {candidate_model}")
+                            print(f"[ElevenLabs] Model dialihkan ke: {candidate_model}")
                             self.model_id = candidate_model
                         last_err = None
                         break
                 except Exception as exc:
                     last_err = exc
-                    if not state["got_any_audio"] and "model" in str(exc).lower():
+                    err_low = str(exc).lower()
+                    if not state["got_any_audio"] and "model" in err_low:
                         continue
+                    if not state["got_any_audio"] and ("pcm" in err_low or "output_format" in err_low or "tier" in err_low or "403" in err_low):
+                        self._pcm_supported = False
                     break
 
             with queue_lock:
@@ -811,16 +851,16 @@ class ElevenLabsTTSEngine:
 
         teach_language.voice_interrupt_event.clear()
 
-        # 1. Jalur Utama: Direct PCM Chunk Streaming (latensi awal ~150-250ms)
-        streamed_ok = await self._stream_pcm_with_lipsync(text, subtitle=subtitle)
+        # 1. Jalur Utama: Direct PCM Chunk Streaming pada 24kHz native (jernih, 0 resampling, latensi ~160ms)
+        streamed_ok = await self._stream_pcm_with_lipsync(text, emotion=emotion, subtitle=subtitle)
         if streamed_ok:
             return
 
         if teach_language.voice_interrupt_event.is_set():
             return
 
-        # 2. Jalur Fallback: Progressive MP3 Stream -> Edge TTS
-        tmp_path = await self.render_audio(text)
+        # 2. Jalur Fallback: Progressive MP3 44.1kHz 128kbps Stream -> Edge TTS
+        tmp_path = await self.render_audio(text, emotion=emotion)
         if not tmp_path:
             if subtitle:
                 self.bridge.subtitle_timed_signal.emit(subtitle, 0)
